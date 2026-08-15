@@ -1,0 +1,12 @@
+# coros-garmin-bridge
+#
+# The COROS client comes from the coros-mcp checkout (COROS_MCP_PATH) and the
+# Garmin session handling from garmin-mcp (GARMIN_MCP_PATH), so their imports
+# have to resolve in this venv too — hence requests and garth here.
+#
+# The FIT editor is deliberately NOT a dependency: the device rewrite is done
+# over HTTP by fit-file-manager-web, so fitparse and crcmod are not needed.
+
+requests>=2.31.0
+python-dotenv>=1.0.0
+garth>=0.4.0

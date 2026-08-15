@@ -1,0 +1,14 @@
+[Unit]
+Description=Run the COROS to Garmin bridge hourly
+Requires=coros-garmin-bridge.service
+
+[Timer]
+# Hourly at :25, matching the cron entry it replaces — offset away from the
+# daily strava/garmin/coros syncs that run at :15.
+OnCalendar=*-*-* *:25:00
+# Catch up after a reboot or a suspended machine rather than waiting an hour.
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

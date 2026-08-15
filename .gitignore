@@ -1,0 +1,41 @@
+# Credentials and secrets
+.env
+
+# Session tokens
+.coros_token.json
+.garth/
+
+# State database
+*.db
+*.db-shm
+*.db-wal
+
+# Activity files — personal training data, never commit
+*.fit
+*.tcx
+*.gpx
+*.zip
+work/
+exports/
+
+# Logs and run state
+*.log
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Claude Code local settings
+.claude/
