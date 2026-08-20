@@ -15,7 +15,7 @@ The one outstanding task is deploying the converter fix to 10.10.1.224.**
 Garmin attributes an upload to the real Fenix 8 only when the file carries a
 Garmin-shaped `device_info` message; the `file_id` rewrite alone yields a
 *manual activity with no device*. `fit_targeted_editor.py` in
-`../fit-file-manager-web` was extended to add the fields a COROS file omits, and
+`../fit-manager` was extended to add the fields a COROS file omits, and
 now produces byte-for-byte the file Garmin accepted (commit `88c6be3` there).
 Read "The premise was tested on 2026-08-20 and it HOLDS" near the bottom first.
 
@@ -28,7 +28,7 @@ Four related projects, all on GitHub under `benniblau`, all deployed to
 |---|---|
 | `../coros-mcp` | Source of activities. Import `CorosClient` from `coros_downloader.py` — it handles region discovery, token caching, `1019` re-login and retries. |
 | `../garmin-mcp` | Destination auth. Reuse the garth session in `.garth/` and the `authenticate()` function in `export_fit.py`. |
-| `../fit-file-manager-web` | Conversion service. Flask + gunicorn on port **7077**. The bridge calls it over HTTP; it does **not** import the editor. |
+| `../fit-manager` | Conversion service. Flask + gunicorn on port **7077**. The bridge calls it over HTTP; it does **not** import the editor. |
 | `../strava-mcp` | Not used, but relevant: if Garmin re-exports uploads to Strava, activities will duplicate there. |
 
 ## Key facts established by prior investigation
@@ -108,7 +108,7 @@ the "verified" list at the bottom of this file used to claim.
 Not in the original design, and each one was arrived at the hard way.
 
 - **The conversion endpoint is `POST /api/v1/convert`** in
-  `fit-file-manager-web` (blueprint `app/blueprints/api_v1.py`). It takes
+  `fit-manager` (blueprint `app/blueprints/api_v1.py`). It takes
   `manufacturer_id` + `product_id` (or `device_name`) plus `serial_number`,
   returns raw FIT bytes, and distinguishes `400` bad request, `422` conversion
   refused (`reason` is `no_device_messages` or `already_in_target_format`) and
@@ -241,7 +241,7 @@ Verified:
   a bad request, 400 for a non-FIT upload, and 422 `already_in_target_format`
   when fed its own output.
 
-This lives in `fit-file-manager-web` on purpose. The bridge reaches the editor
+This lives in `fit-manager` on purpose. The bridge reaches the editor
 over HTTP and does not carry its own copy of FIT logic — see "Conventions to
 follow".
 

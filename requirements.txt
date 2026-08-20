@@ -5,7 +5,7 @@
 # have to resolve in this venv too — hence requests and garth here.
 #
 # The FIT editor is deliberately NOT a dependency: the device rewrite is done
-# over HTTP by fit-file-manager-web, so fitparse and crcmod are not needed.
+# over HTTP by fit-manager, so fitparse and crcmod are not needed.
 
 requests>=2.31.0
 python-dotenv>=1.0.0

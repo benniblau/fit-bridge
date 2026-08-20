@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-HTTP client for the fit-file-manager-web conversion service.
+HTTP client for the fit-manager conversion service.
 
 The device rewrite lives in fit_targeted_editor.py, which the bridge reaches
 over HTTP rather than importing. That keeps one copy of the editor running as

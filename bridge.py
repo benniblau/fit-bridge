@@ -9,7 +9,7 @@ hourly from cron.
 
     list  ──► COROS /activity/query           (CorosClient, from coros-mcp)
     fetch ──► COROS /activity/detail/download → signed URL → bytes
-    edit  ──► fit-file-manager-web /api/v1/convert
+    edit  ──► fit-manager /api/v1/convert
     push  ──► Garmin /upload-service/upload/fit  (garth, session from garmin-mcp)
     log   ──► bridge.db
 

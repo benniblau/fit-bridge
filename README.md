@@ -12,7 +12,7 @@ cron (hourly)
    │
    ▼
 bridge.py ──────────► COROS API                list new activities, download FIT
-   ├──────────────► fit-file-manager-web        rewrite device identity
+   ├──────────────► fit-manager        rewrite device identity
    ├──────────────► Garmin Connect              upload
    └──────────────► bridge.db                   state, dedup, retries
 ```
@@ -34,7 +34,7 @@ join them. Confirm real badge progress before setting `BRIDGE_ENABLED=true`.
 
 Getting there needed more than a `file_id` rewrite. Garmin matches an upload to
 a registered device on `device_info`, which a COROS file barely populates; see
-`CLAUDE.md` and `fit-file-manager-web` commit `88c6be3`.
+`CLAUDE.md` and `fit-manager` commit `88c6be3`.
 
 ## Layout
 
@@ -42,7 +42,7 @@ a registered device on `device_info`, which a COROS file barely populates; see
 |---|---|
 | `bridge.py` | Cron entrypoint: window, selection, orchestration, state |
 | `coros_source.py` | Lists activities and downloads FIT bytes (wraps `CorosClient`) |
-| `converter.py` | HTTP client for `fit-file-manager-web` `/api/v1/convert` |
+| `converter.py` | HTTP client for `fit-manager` `/api/v1/convert` |
 | `garmin_sink.py` | Garmin auth (garth) and upload, including 409 handling |
 | `schema/schema_bridge.sql` | State database — the single source of truth |
 | `deploy/` | Optional systemd unit and timer, as an alternative to cron |
@@ -68,7 +68,7 @@ The two things that must be right in `.env`:
   While it is false every scheduled run is a no-op, so cron can be installed
   immediately and the bridge switched on later by flipping one value.
 
-`fit-file-manager-web` must be running (port 7077 by default) and the
+`fit-manager` must be running (port 7077 by default) and the
 `garmin-mcp` garth session must be alive — the bridge does not keep its own
 Garmin credentials.
 
@@ -129,7 +129,7 @@ Hourly at :25, offset away from the daily syncs at :15. `deploy/` holds a
 systemd service and timer as an alternative — use one or the other, not both.
 
 The conversion service is a separate unit on the same host,
-`fit-file-manager.service`, gunicorn on port 7077. The bridge health-checks it
+`fit-manager.service`, gunicorn on port 7077. The bridge health-checks it
 before doing any work, so if it is down a run aborts without spending a retry
 attempt on every candidate.
 
@@ -161,4 +161,4 @@ are still open.
 |---|---|
 | [`coros-mcp`](https://github.com/benniblau/coros-mcp) | Source — provides `CorosClient` |
 | [`garmin-mcp`](https://github.com/benniblau/garmin-mcp) | Destination auth — garth session |
-| [`fit-file-manager-web`](https://github.com/benniblau/fit-file-manager-web) | Conversion service on port 7077 |
+| [`fit-manager`](https://github.com/benniblau/fit-manager) | Conversion service on port 7077 |
