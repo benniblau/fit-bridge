@@ -22,9 +22,19 @@ costs nothing and no activity is ever uploaded twice.
 
 ## Before trusting it
 
-The premise — that Garmin awards badges for an uploaded file claiming a
-registered device — is **unverified**. Test with a single activity and confirm
-badge progress before relying on it. See "Verification" below.
+Tested against a genuine COROS recording on 2026-08-20. Garmin accepts the
+upload and attributes it to the registered Garmin watch — same `deviceId` and
+`deviceTypePk` as that watch's own recordings, and not flagged as a manual
+activity.
+
+That attribution is the precondition the project rests on, but the **badge
+award itself has not been observed directly**: Garmin recomputes badge progress
+asynchronously, and its monthly challenges report `userJoined: false` until you
+join them. Confirm real badge progress before setting `BRIDGE_ENABLED=true`.
+
+Getting there needed more than a `file_id` rewrite. Garmin matches an upload to
+a registered device on `device_info`, which a COROS file barely populates; see
+`CLAUDE.md` and `fit-file-manager-web` commit `88c6be3`.
 
 ## Layout
 
@@ -58,7 +68,7 @@ The two things that must be right in `.env`:
   While it is false every scheduled run is a no-op, so cron can be installed
   immediately and the bridge switched on later by flipping one value.
 
-`fit-file-manager-web` must be running (port 7000 by default) and the
+`fit-file-manager-web` must be running (port 7077 by default) and the
 `garmin-mcp` garth session must be alive — the bridge does not keep its own
 Garmin credentials.
 
@@ -118,6 +128,11 @@ sqlite3 bridge.db "SELECT * FROM v_bridge_runs"        # run history
 Hourly at :25, offset away from the daily syncs at :15. `deploy/` holds a
 systemd service and timer as an alternative — use one or the other, not both.
 
+The conversion service is a separate unit on the same host,
+`fit-file-manager.service`, gunicorn on port 7077. The bridge health-checks it
+before doing any work, so if it is down a run aborts without spending a retry
+attempt on every candidate.
+
 ## Verification
 
 1. `bridge.py --dry-run` — lists candidates against live COROS, touches nothing.
@@ -135,10 +150,15 @@ Step 2 is the go/no-go, and it needs a genuine COROS recording — an activity
 that was imported into COROS from Garmin is already in Garmin, so uploading it
 back proves nothing except that duplicate detection works.
 
+Steps 1–3 were completed on 2026-08-20 against the first real COROS recording.
+Step 3 in particular: a forced re-run while the activity was already in Garmin
+came back `duplicate`, not `failed`, and created no second copy. Steps 4 and 5
+are still open.
+
 ## Related projects
 
 | Project | Role |
 |---|---|
 | [`coros-mcp`](https://github.com/benniblau/coros-mcp) | Source — provides `CorosClient` |
 | [`garmin-mcp`](https://github.com/benniblau/garmin-mcp) | Destination auth — garth session |
-| [`fit-file-manager-web`](https://github.com/benniblau/fit-file-manager-web) | Conversion service on port 7000 |
+| [`fit-file-manager-web`](https://github.com/benniblau/fit-file-manager-web) | Conversion service on port 7077 |

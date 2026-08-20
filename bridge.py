@@ -147,7 +147,7 @@ class Config:
             enabled=_env_bool("BRIDGE_ENABLED", False),
             start_date=start_date,
             db_path=Path(os.getenv("BRIDGE_DB_PATH", str(DEFAULT_DB_PATH))),
-            converter_url=os.getenv("BRIDGE_CONVERTER_URL", "http://127.0.0.1:7000"),
+            converter_url=os.getenv("BRIDGE_CONVERTER_URL", "http://127.0.0.1:7077"),
             converter_api_key=(os.getenv("BRIDGE_CONVERTER_API_KEY")
                                or os.getenv("FIT_API_KEY")),
             manufacturer_id=_env_int("BRIDGE_MANUFACTURER_ID", DEFAULT_MANUFACTURER_ID),

@@ -74,7 +74,7 @@ def convert(data: bytes, filename: str, base_url: str, manufacturer_id: int,
     Args:
         data: the FIT file as downloaded from COROS
         filename: name to send, only used for the multipart part and logging
-        base_url: e.g. http://127.0.0.1:7000
+        base_url: e.g. http://127.0.0.1:7077
         manufacturer_id: FIT manufacturer id (1 = garmin)
         product_id: product id for that manufacturer (4536 = fenix 8)
         serial_number: serial to claim; preserving a real registered device's

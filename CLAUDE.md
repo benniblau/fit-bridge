@@ -10,11 +10,14 @@ This bridge keeps it alive: pull each new COROS activity as a FIT file, rewrite
 its recording-device identity to the Fenix 8 he actually owns, upload it to
 Garmin Connect. One-way, COROS → Garmin, hourly from cron.
 
-**Status: implemented, not yet deployed, premise still unverified.**
-`README.md` describes what exists and how to verify it.
-Everything up to the Garmin upload has been exercised against live COROS and a
-live conversion service. The upload itself has never run — see "The premise is
-unverified" at the bottom.
+**Status: implemented and working end to end. Premise CONFIRMED on 2026-08-20.
+The one outstanding task is deploying the converter fix to 10.10.1.224.**
+Garmin attributes an upload to the real Fenix 8 only when the file carries a
+Garmin-shaped `device_info` message; the `file_id` rewrite alone yields a
+*manual activity with no device*. `fit_targeted_editor.py` in
+`../fit-file-manager-web` was extended to add the fields a COROS file omits, and
+now produces byte-for-byte the file Garmin accepted (commit `88c6be3` there).
+Read "The premise was tested on 2026-08-20 and it HOLDS" near the bottom first.
 
 ## Where this sits
 
@@ -25,7 +28,7 @@ Four related projects, all on GitHub under `benniblau`, all deployed to
 |---|---|
 | `../coros-mcp` | Source of activities. Import `CorosClient` from `coros_downloader.py` — it handles region discovery, token caching, `1019` re-login and retries. |
 | `../garmin-mcp` | Destination auth. Reuse the garth session in `.garth/` and the `authenticate()` function in `export_fit.py`. |
-| `../fit-file-manager-web` | Conversion service. Flask + gunicorn on port **7000**. The bridge calls it over HTTP; it does **not** import the editor. |
+| `../fit-file-manager-web` | Conversion service. Flask + gunicorn on port **7077**. The bridge calls it over HTTP; it does **not** import the editor. |
 | `../strava-mcp` | Not used, but relevant: if Garmin re-exports uploads to Strava, activities will duplicate there. |
 
 ## Key facts established by prior investigation
@@ -47,8 +50,36 @@ Do not re-derive these; they cost a lot to establish.
   timestamps are preserved deliberately — an earlier version flattened them and
   produced files COROS accepted but computed nothing for.
 - Real COROS product ids, decoded from genuine recordings: 804 PACE 3, 805 PACE
-  Pro, 806 PACE 4, 822 APEX 2 Pro, 831 VERTIX, 832 VERTIX 2, 841 APEX Pro, 851
-  DURA. **VERTIX 2S is not among them and its id is unknown.**
+  Pro, 806 PACE 4, 822 APEX 2 Pro, 831 VERTIX, 832 VERTIX 2, **833 VERTIX 2S**,
+  841 APEX Pro, 851 DURA. 833 was decoded on 2026-08-20 from the first genuine
+  VERTIX 2S recording (COROS label `479760828581576905`).
+
+### The serial is NOT written into a genuine COROS recording
+
+Established 2026-08-20, on the first real VERTIX 2S file. This contradicts what
+the "verified" list at the bottom of this file used to claim.
+
+- A genuine COROS `file_id` carries `type`, `manufacturer`, `product`,
+  `time_created` and `product_name` — and **no `serial_number` field at all**.
+- `fit_targeted_editor.py` rewrites fields **in place**. Its guard is
+  `loc['serial_number_offset'] is not None` (around line 419): where the field
+  is absent it silently writes nothing. It cannot add a field, because that
+  means resizing the record definition.
+- So converting a real COROS file yields `file_id` = garmin/4536 with **no
+  serial**, plus a leftover `file_id.product_name` and a `device_info` message
+  both still reading `COROS VERTIX 2S`.
+- `POST /api/v1/convert` still answers `200` and still echoes
+  `X-Fit-Serial-Number: <requested>` — that header reflects the *request*, not
+  what was written, so neither the service nor `converter.py` notices.
+- Why this was missed: every earlier test used a COROS activity **imported from
+  Garmin**. Those are Garmin's own recordings stored byte-for-byte, so their
+  `file_id` already carried the real `serial_number` and garmin/4536. The
+  serial appeared to survive because it was never actually written.
+- The real Fenix 8 identity, confirmed against both the device registration
+  (`GET /device-service/deviceregistration/devices`, field `unitId`) and that
+  watch's own FIT files (`file_id.serial_number`): product **4536**, part number
+  006-B4536-00, "fenix 8 - 51mm, AMOLED". The unit id itself is the serial and
+  stays out of this repo — it lives in `.env` as `BRIDGE_GARMIN_SERIAL`.
 
 ### Garmin upload
 
@@ -130,7 +161,131 @@ Match the sibling projects:
 - One activity failing must never abort the run.
 - `BRIDGE_MAX_PER_RUN` bounds the blast radius of a bug.
 
-## The premise is unverified
+## The premise was tested on 2026-08-20 and it HOLDS — with a bigger rewrite
+
+The first genuine VERTIX 2S recording (`479760828581576905`, 13.78 km) was put
+through the bridge and uploaded three times. The third attempt produced an
+activity Garmin attributes to the real Fenix 8, indistinguishable from one the
+watch recorded itself:
+
+| upload | `deviceMetaDataDTO` | `manualActivity` |
+|---|---|---|
+| 1 — converter as-is | `{deviceId: "0", deviceTypePk: 19, deviceVersionPk: 80}` | `True` |
+| 2 — plus `file_id.serial_number` | `{deviceId: "0", deviceTypePk: 19, deviceVersionPk: 80}` | `True` |
+| 3 — plus a Garmin-shaped `device_info` | `{deviceId: "<the real unit id>", deviceTypePk: 37161, deviceVersionPk: 1004425}` | `False` |
+| *a real Fenix 8 recording* | `{deviceId: "<the same unit id>", deviceTypePk: 37161, deviceVersionPk: 1014322}` | `False` |
+
+**`device_info` is what Garmin matches on, not `file_id`.** Rewriting `file_id`
+alone — which is all `/api/v1/convert` does — produces a *manual activity with
+no device*, the category Garmin excludes from badges. Adding
+`file_id.serial_number` changes nothing on its own. What flips it is a
+`device_info` message carrying `device_index=0` (creator), `manufacturer=1`,
+`product=4536` and `serial_number=<the registered unit id>`.
+
+### Why the current converter cannot do this
+
+A genuine COROS recording declares far less than a Garmin one:
+
+    COROS   file_id     {type, manufacturer, product, time_created, product_name}
+            device_info {timestamp, manufacturer, product_name}          3 fields
+    Garmin  file_id     {serial_number, time_created, 7, manufacturer, product, number, type}
+            device_info {…28 fields, incl. device_index, serial_number, product}
+
+`fit_targeted_editor.py` rewrites fields **in place** and cannot add one — its
+serial guard is `loc['serial_number_offset'] is not None` (around line 419), so
+where the field is absent it silently writes nothing. It also never touches this
+`device_info` at all, because it only considers messages that declare *both*
+manufacturer and product, and the COROS one has no product field.
+
+Worse, `/api/v1/convert` still answers `200` and still echoes
+`X-Fit-Serial-Number: <requested>` — that header reflects the request, not the
+file — so neither the service nor `converter.py` can tell it did nothing.
+
+Every earlier test used a COROS activity **imported from Garmin**. Those are
+Garmin's own recordings stored byte-for-byte, so they already had all of this.
+The serial looked preserved because it was never written.
+
+### The fix, in `fit_targeted_editor.py`
+
+`add_missing_identity_fields()` runs before anything is patched. It declares the
+fields the source omits — `file_id.serial_number`, and `device_info`'s
+`device_index`, `product` and `serial_number` — which means growing those
+definition messages and every data record using them, then repairing
+`data_size`. It also blanks the leftover `product_name` ("COROS VERTIX 2S")
+whenever the device actually changes.
+
+Values are **seeded, not final**: `serial_number` goes in as the invalid
+sentinel, and `device_info.product` is seeded with `file_id`'s *current* product
+so the existing in-place pass recognises the message as the recording device
+rather than a paired sensor and fills everything in. That way the audited
+in-place code is untouched and does all the actual writing.
+
+Guard: `device_info` is only augmented when the file has **exactly one**
+`device_info` record naming the same manufacturer as `file_id`. With several
+there is no way to tell the watch from a paired sensor without a `device_index`,
+and mislabelling a heart-rate strap as the watch is worse than doing nothing.
+
+`find_message_byte_locations_in_data()` was split out of
+`find_message_byte_locations()`, because augmentation moves every offset after
+`file_id` and the locations must come from the augmented buffer.
+
+Verified:
+
+- Output is **byte-identical** to the file Garmin accepted and attributed.
+- Against the pre-change editor, output is **byte-identical on every
+  Garmin-shaped file** (a real Fenix 8 recording relabelled to itself and to an
+  Edge 1030, and a Garmin-origin COROS activity). Only the genuine COROS file
+  differs, by +23 bytes.
+- Over HTTP: `POST /api/v1/convert` returns those same bytes, by
+  `manufacturer_id`/`product_id` and by `device_name`, and still answers 400 for
+  a bad request, 400 for a non-FIT upload, and 422 `already_in_target_format`
+  when fed its own output.
+
+This lives in `fit-file-manager-web` on purpose. The bridge reaches the editor
+over HTTP and does not carry its own copy of FIT logic — see "Conventions to
+follow".
+
+Remaining cosmetic gap: `deviceVersionPk` is 1004425 rather than 1014322,
+because the COROS file has no `file_creator` message. A real Fenix 8 file
+carries `file_creator{software_version: 2241}`. Adding it would make the two
+identical; it did not affect device attribution.
+
+### Still to confirm
+
+Badge and challenge *award* was not directly observed — Garmin recomputes
+asynchronously, and the monthly challenges (`August Rundown` and friends) report
+`userJoined: false`, so they track no progress until joined. What is established
+is the precondition the whole project rests on: the upload is attributed to the
+registered Fenix 8 and is not flagged manual. Confirm an actual badge before
+switching `BRIDGE_ENABLED` on.
+
+### Other things that surfaced during the test
+
+- `POST /upload-service/upload/fit` answers **202 with no import result**, so
+  `garmin_sink._classify()` takes its "Accepted with no import result reported"
+  branch and `garmin_activity_id` is **never populated**. The upload id is
+  recorded; the activity id is not. Resolving it needs a follow-up poll.
+- Garmin's activity list is briefly stale after a `DELETE` (204).
+- A deleted activity can be re-uploaded: all three attempts went through after
+  deleting the previous one, with no 409.
+- **Garmin's 409 was finally exercised for real.** A full
+  `bridge.py --only … --force` against the patched converter, while the activity
+  was already in Garmin, came back `duplicate` and not `failed`, and created no
+  second copy — README verification step 3, previously only tested against
+  fakes.
+- The external device changer at fitfiletools.com/changer was compared against
+  this implementation. It also adds `device_info.product`, but writes **no
+  serial and no `device_index`** and leaves the "COROS VERTIX 2S" strings in
+  place. It additionally writes `enhanced_speed`/`enhanced_altitude` (record
+  fields 73/78) and the session equivalents (124/125), which costs +19% file
+  size and is semantically redundant — the FIT profile derives those from the
+  legacy 16-bit `speed`/`altitude`, and the SDK reports identical values for the
+  unmodified COROS file. Whether its no-serial output is attributed correctly by
+  Garmin was **not tested**.
+- `Decoder.check_integrity()` consumes its `Stream`; call it on its own stream
+  or a following `read()` silently returns nothing.
+
+## The original premise, as written before the test
 
 Whether Garmin actually awards badges for an uploaded file claiming a registered
 device **has never been tested** — and it is the entire point of the project.
@@ -148,11 +303,23 @@ What has been verified, so the next session does not redo it:
 
 - The device rewrite, against the official `garmin_fit_sdk` decoder:
   `check_integrity()` true, zero decode errors, `file_id` showing
-  garmin/fenix8 and the configured serial, paired sensors untouched,
-  every `record`, `lap`,
+  garmin/fenix8, paired sensors untouched, every `record`, `lap`,
   `session` and `split` message identical to the source, 38–90 bytes changed
   out of ~745 kB. (Watch out when diffing decoded messages: unset float fields
-  are NaN, and NaN != NaN, so a naive comparison reports every one of them.)
+  are NaN, and NaN != NaN, so a naive comparison reports every one of them.
+  And call `check_integrity()` on its own `Stream` — it consumes the stream, so
+  a `read()` afterwards silently returns nothing.)
+  **The "and the configured serial" part of this claim was wrong**, and only
+  held because the file under test came from Garmin already. See "The serial is
+  NOT written into a genuine COROS recording" above, and note that the serial
+  alone turned out not to be what Garmin matches on anyway.
+- On the first genuine VERTIX 2S recording (2026-08-20,
+  `479760828581576905`, 175,689 bytes): listing, download, convert and the
+  state database all work. The conversion changes exactly 6 bytes —
+  `file_id.manufacturer` 294→1, `file_id.product` 833→4536, and the file CRC —
+  and the result decodes clean. **Not yet uploaded**, because it is the only
+  real recording that exists and Garmin will 409 every later attempt, so it is
+  a one-shot go/no-go that should not be spent on a file missing the serial.
 - `POST /api/v1/convert` end to end, including its 400/401/413/422 paths, and
   that the old `/api/convert` and the web UI still work.
 - The bridge's listing, selection, capping, skip list, retry accounting and
