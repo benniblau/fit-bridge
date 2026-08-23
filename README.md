@@ -94,10 +94,18 @@ pause switch still holds for scheduled runs.
 2. **Filter** — drop anything already settled, anything below the start date,
    and any sport type in `BRIDGE_SKIP_SPORTS`.
 3. **Download** — signed export URL → FIT bytes, sha256 recorded.
-4. **Convert** — `POST /api/v1/convert` with `manufacturer_id`, `product_id`
-   and `serial_number`, sha256 recorded.
+4. **Convert** — `POST /api/v1/convert` with `manufacturer_id`, `product_id`,
+   `serial_number` and `time_created`, sha256 recorded.
 5. **Upload** — `POST /upload-service/upload/fit` through garth.
 6. **Record** — `uploaded`, `duplicate`, `skipped` (all terminal) or `failed`.
+
+`time_created` is the activity's start time, and it is not cosmetic. Garmin
+identifies an upload by `file_id`'s `(serial_number, time_created)` pair, and
+COROS stamps `time_created` at export time — so every activity in one sync
+batch carries the same value. Since every file gets the same serial by design,
+without this the batch is a single file to Garmin and everything after the
+first comes back 409, which is terminal. It cost one activity of three on
+2026-08-23 before it was found.
 
 `failed` retries until `BRIDGE_MAX_ATTEMPTS`, then stops and shows up in
 `--status` so it can be inspected rather than looping forever. One activity

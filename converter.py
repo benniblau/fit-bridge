@@ -66,6 +66,7 @@ def health(base_url: str, api_key: Optional[str] = None,
 
 def convert(data: bytes, filename: str, base_url: str, manufacturer_id: int,
             product_id: int, serial_number: Optional[int] = None,
+            time_created: Optional[int] = None,
             api_key: Optional[str] = None,
             timeout: int = 180) -> Tuple[bytes, str]:
     """
@@ -79,6 +80,11 @@ def convert(data: bytes, filename: str, base_url: str, manufacturer_id: int,
         product_id: product id for that manufacturer (4536 = fenix 8)
         serial_number: serial to claim; preserving a real registered device's
             serial is the point of the whole exercise, so this is normally set
+        time_created: Unix timestamp to stamp the file with, normally the moment
+            the recording started. Garmin identifies an upload by this together
+            with the serial, and COROS stamps every file in a sync batch with
+            the same value, so leaving it alone loses activities — see the
+            comment at the call site in bridge.py
         api_key: sent as X-API-Key when the service requires one
     """
     form = {
@@ -87,6 +93,8 @@ def convert(data: bytes, filename: str, base_url: str, manufacturer_id: int,
     }
     if serial_number is not None:
         form["serial_number"] = str(serial_number)
+    if time_created is not None:
+        form["time_created"] = str(time_created)
 
     headers = {"X-API-Key": api_key} if api_key else {}
 

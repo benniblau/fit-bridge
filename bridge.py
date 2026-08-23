@@ -436,11 +436,26 @@ def process(conn: sqlite3.Connection, cfg: Config, client: Any,
             client, label, summary["sport_type"])
         print(f"    📥 {len(raw):,} bytes from COROS")
 
+        # The recording's start time is stamped into file_id.time_created,
+        # because Garmin identifies an upload by that together with the serial.
+        # A Garmin watch sets it when the recording starts, so it is unique per
+        # activity; COROS sets it when the file is exported, so every activity
+        # in one sync batch carries the same value. Since every file here is
+        # given the same serial by design, the batch collapses to a single
+        # identity and Garmin answers 409 for all but the first — silently, and
+        # terminally, because a duplicate is never retried. Cost: one activity
+        # of three on 2026-08-23.
+        start_time = summary.get("start_time")
+        if not start_time:
+            print("    ⚠️  no start time from COROS — uploading with the file's "
+                  "own timestamp, which may collide with a sibling activity")
+
         converted, converted_sha = converter.convert(
             raw, filename, cfg.converter_url,
             manufacturer_id=cfg.manufacturer_id,
             product_id=cfg.product_id,
             serial_number=cfg.serial_number,
+            time_created=start_time or None,
             api_key=cfg.converter_api_key,
         )
         print(f"    🔁 rewritten to manufacturer={cfg.manufacturer_id} "

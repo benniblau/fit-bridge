@@ -10,14 +10,18 @@ This bridge keeps it alive: pull each new COROS activity as a FIT file, rewrite
 its recording-device identity to the Fenix 8 he actually owns, upload it to
 Garmin Connect. One-way, COROS → Garmin, hourly from cron.
 
-**Status: implemented and working end to end. Premise CONFIRMED on 2026-08-20.
-The one outstanding task is deploying the converter fix to 10.10.1.224.**
+**Status: live on 10.10.1.224, `BRIDGE_ENABLED=true`, running hourly from cron.
+Premise CONFIRMED on 2026-08-20. Badge award itself is still unconfirmed.**
 Garmin attributes an upload to the real Fenix 8 only when the file carries a
 Garmin-shaped `device_info` message; the `file_id` rewrite alone yields a
 *manual activity with no device*. `fit_targeted_editor.py` in
 `../fit-manager` was extended to add the fields a COROS file omits, and
 now produces byte-for-byte the file Garmin accepted (commit `88c6be3` there).
 Read "The premise was tested on 2026-08-20 and it HOLDS" near the bottom first.
+
+The first multi-activity day, 2026-08-23, then lost one run of three to a
+second identity collision — see "Garmin identifies an upload by
+(serial_number, time_created)". Read that before touching the conversion call.
 
 ## Where this sits
 
@@ -91,6 +95,41 @@ the "verified" list at the bottom of this file used to claim.
   the human-readable reason is at `failures[0].messages[0]`.
 - `garth.upload()` needs a real file handle — a bare `BytesIO` fails because it
   reads `fp.name`.
+
+### Garmin identifies an upload by (serial_number, time_created)
+
+Established 2026-08-23, the hard way: three runs recorded that morning, two
+uploaded, one lost.
+
+Both fields live in `file_id`. A Garmin watch stamps `time_created` when the
+recording starts, so it is unique per activity. **COROS stamps it when the file
+is exported**, so every activity in one sync batch carries the same value:
+
+    ...310137  2.14 km   time_created 09:47:21Z   session start 06:37:59Z
+    ...310138 20.97 km   time_created 09:47:21Z   session start 07:30:19Z
+    ...310139  3.01 km   time_created 09:47:22Z   session start 09:25:36Z
+
+The bridge writes the same serial into all of them by design, so to Garmin
+`...310138` was the same file as `...310137`. It came back **409, and 409 is
+terminal** — `duplicate` is never retried, so the run was lost silently and
+permanently. `...310139` survived only because the sync clock ticked over.
+
+Nothing was wrong with that file: re-converting it reproduced the recorded
+`converted_sha256` exactly, `device_info` and all.
+
+The fix is to pass the recording's start time as `time_created` — which is what
+a real Fenix 8 file carries (verified on activity `24010567666`: `time_created`
+and `session.start_time` are both `13:28:10Z`). COROS's list `startTime` is
+exactly the session start, so the bridge already has the value. See
+`fit-manager` commit `ae6d40f`; the editor writes it in place and
+**raises rather than skip a field it cannot write**, so a 200 now means the
+value actually reached the file.
+
+The general lesson, twice over now: this project rewrites files to a single
+device identity, and *anything* Garmin uses to tell two files apart has to be
+made unique deliberately. And a converter that echoes a requested value back in
+a response header teaches you nothing — that is how the missing `device_info`
+survived for weeks.
 
 ### COROS behaviour
 
