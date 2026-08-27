@@ -2,130 +2,103 @@
 """
 COROS side of the bridge: list new activities and fetch their FIT files.
 
-The two halves reach COROS by deliberately different routes.
+Both hops are HTTP calls to coros-mcp, which owns the COROS API — regional host
+discovery, token caching, the 1019 re-login path, per-request retries and the
+two-hop signed-URL export. None of that is reimplemented here, and neither are
+COROS credentials held here: this module speaks only to a service on this
+machine.
 
-**Listing** goes to COROS directly, through `CorosClient` from the coros-mcp
-checkout — which owns regional host discovery, token caching, the 1019
-re-login path and per-request retries. It has to be live: coros-mcp's REST API
-serves its local SQLite mirror, populated by a downloader on its own schedule,
-so an activity recorded in the last hour is not in it yet. The bridge runs
-hourly precisely to catch those, and routing the listing through the mirror
-would put a sync's worth of latency in front of every upload and make the
-bridge fail whenever that sync did.
+    list  ──► GET /api/v1/activities/live?start_day=&end_day=
+    fetch ──► GET /api/v1/activities/{label_id}/file?sport_type=
 
-**Fetching the file** goes over HTTP to coros-mcp's
-`GET /api/v1/activities/{label_id}/file`, which is freshness-independent — it
-asks COROS for a signed export URL and follows it, whatever the mirror knows.
-The sport type is passed explicitly for exactly that reason: it comes from the
-live listing above, so an activity the mirror has never seen still exports.
-
-That leaves one copy of the two-hop export dance, in the project that owns the
-COROS API, rather than a second one here — the same reasoning that keeps the
-FIT editor in fit-manager and reaches it over HTTP.
+Both are answered from COROS itself rather than coros-mcp's local mirror, which
+matters: that mirror is refreshed by a downloader on its own schedule, so an
+activity recorded in the last hour — exactly what an hourly run exists to
+catch — is not in it yet. `/activities/live` exists for that reason, and the
+file route takes an explicit `sport_type` for the same one, so an activity the
+mirror has never seen still exports.
 """
 
-import os
-import sys
-from contextlib import contextmanager
-from pathlib import Path
+import hashlib
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
-
-# Same convention migrate_to_coros.py uses for FIT_EDITOR_PATH: a sensible
-# sibling-directory default, overridable by environment variable.
-DEFAULT_COROS_MCP_PATH = Path(__file__).parent.parent / "coros-mcp"
-
-# The list endpoint rejects sizes above 200.
-PAGE_SIZE = 200
 
 # A FIT file carries its signature at bytes 8..12. coros-mcp checks this too;
 # it is repeated here because the bytes crossed a network in between.
 FIT_SIGNATURE = b".FIT"
 
+LIVE_PATH = "/api/v1/activities/live"
 FILE_PATH = "/api/v1/activities/{label_id}/file"
 HEALTH_PATH = "/api/v1/health"
-
-_client_module = None
-
-
-def _load_coros_module():
-    """Import coros_downloader from the coros-mcp checkout, once."""
-    global _client_module
-    if _client_module is not None:
-        return _client_module
-
-    path = Path(os.getenv("COROS_MCP_PATH", str(DEFAULT_COROS_MCP_PATH))).resolve()
-    if not (path / "coros_downloader.py").exists():
-        raise SourceError(
-            f"Could not find coros_downloader.py under {path}. "
-            "Set COROS_MCP_PATH to your coros-mcp checkout."
-        )
-    sys.path.insert(0, str(path))
-    import coros_downloader                                       # noqa: PLC0415
-
-    _client_module = coros_downloader
-    return _client_module
 
 
 class SourceError(RuntimeError):
     """Raised when COROS cannot be reached or answers with something unusable."""
 
 
-def connect() -> Any:
-    """Return an authenticated CorosClient, for listing."""
-    module = _load_coros_module()
+def _headers(api_token: Optional[str]) -> Dict[str, str]:
+    return {"Authorization": f"Bearer {api_token}"} if api_token else {}
+
+
+def _get(url: str, base_url: str, api_token: Optional[str], timeout: int,
+         params: Optional[Dict[str, Any]] = None, what: str = "COROS"):
+    """One GET against coros-mcp, with its failures phrased as SourceError."""
     try:
-        client = module.CorosClient()
-        client.authenticate()
-    except module.CorosError as e:
-        raise SourceError(str(e)) from e
-    return client
+        resp = requests.get(url, params=params, headers=_headers(api_token),
+                            timeout=timeout)
+    except requests.RequestException as e:
+        raise SourceError(f"coros-mcp unreachable at {base_url} "
+                          f"while fetching {what}: {e}") from e
+
+    if resp.status_code != 200:
+        try:
+            message = (resp.json() or {}).get("error")
+        except ValueError:
+            message = resp.text[:200]
+        raise SourceError(f"coros-mcp returned HTTP {resp.status_code} "
+                          f"for {what}: {message}")
+    return resp
 
 
-@contextmanager
-def _translated():
+def health(base_url: str, api_token: Optional[str] = None,
+           timeout: int = 10) -> dict:
     """
-    Present COROS's own exception as a SourceError.
+    Check the coros-mcp service before a run tries to fetch anything.
 
-    The bridge catches one error type per hop and decides from that whether an
-    activity failed or the run should stop; leaking CorosError through would
-    land in the catch-all handler and print a traceback into the cron log.
+    Unauthenticated on the server side, so this says the service is up, not
+    that the token is right — a wrong token surfaces on the first real call.
     """
+    resp = _get(base_url.rstrip("/") + HEALTH_PATH, base_url, None, timeout,
+                what="health")
     try:
-        yield
-    except _load_coros_module().CorosError as e:
-        raise SourceError(str(e)) from e
+        return resp.json()
+    except ValueError:
+        raise SourceError("coros-mcp health check did not answer with JSON")
 
 
-def list_activities(client: Any, start_day: int, end_day: int) -> List[Dict[str, Any]]:
+def list_activities(start_day: int, end_day: int, base_url: str,
+                    api_token: Optional[str] = None,
+                    timeout: int = 120) -> List[Dict[str, Any]]:
     """
     Every activity COROS reports in [start_day, end_day], as raw list items.
 
-    Dates are COROS's integer YYYYMMDD. The list endpoint pages; a run that
-    stops early would silently miss activities, so all pages are read.
+    Dates are COROS's integer YYYYMMDD. Paging is the service's problem: it
+    reads every page before answering, so a short list here means COROS had
+    nothing more, never that the walk stopped early.
     """
-    activities: List[Dict[str, Any]] = []
-    page = 1
+    resp = _get(base_url.rstrip("/") + LIVE_PATH, base_url, api_token, timeout,
+                params={"start_day": start_day, "end_day": end_day},
+                what=f"the activity list {start_day}..{end_day}")
+    try:
+        body = resp.json() or {}
+    except ValueError:
+        raise SourceError("coros-mcp did not answer the activity list with JSON")
 
-    while True:
-        with _translated():
-            data = client.query_activities(page=page, size=PAGE_SIZE,
-                                           start_day=start_day, end_day=end_day)
-        if not (data.get("count") or 0):
-            # COROS omits dataList and totalPage entirely when nothing matches.
-            break
-
-        batch = data.get("dataList") or []
-        if not batch:
-            break
-        activities.extend(batch)
-
-        total_pages = data.get("totalPage") or 1
-        if page >= total_pages:
-            break
-        page += 1
-
+    activities = body.get("activities")
+    if activities is None:
+        raise SourceError("coros-mcp answered the activity list without an "
+                          "`activities` field")
     return activities
 
 
@@ -142,63 +115,20 @@ def summarize(activity: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _headers(api_token: Optional[str]) -> Dict[str, str]:
-    return {"Authorization": f"Bearer {api_token}"} if api_token else {}
-
-
-def health(base_url: str, api_token: Optional[str] = None,
-           timeout: int = 10) -> dict:
-    """
-    Check the coros-mcp service before a run tries to fetch anything.
-
-    Unauthenticated on the server side, so this says the service is up, not
-    that the token is right — a wrong token surfaces on the first fetch.
-    """
-    try:
-        resp = requests.get(base_url.rstrip("/") + HEALTH_PATH, timeout=timeout)
-    except requests.RequestException as e:
-        raise SourceError(f"coros-mcp unreachable at {base_url}: {e}") from e
-    if resp.status_code != 200:
-        raise SourceError(
-            f"coros-mcp health check returned HTTP {resp.status_code}")
-    try:
-        return resp.json()
-    except ValueError:
-        raise SourceError("coros-mcp health check did not answer with JSON")
-
-
 def download_fit(label_id: str, sport_type: int, base_url: str,
                  api_token: Optional[str] = None,
                  timeout: int = 180) -> Tuple[bytes, str]:
     """
     Download one activity's original FIT file. Returns (bytes, sha256).
 
-    The sha256 comes from the service's X-Coros-Sha256 header when it is
-    present and is verified against the bytes that arrived, so a truncated
-    response is caught here rather than becoming a mysterious conversion
-    failure one hop later.
+    The sha256 is verified against the service's X-Coros-Sha256 header when it
+    is present, so a truncated response is caught here rather than becoming a
+    mysterious conversion failure one hop later.
     """
-    import hashlib
-
-    url = (base_url.rstrip("/")
-           + FILE_PATH.format(label_id=label_id))
-    try:
-        resp = requests.get(url, params={"sport_type": sport_type,
-                                         "file_type": "fit"},
-                            headers=_headers(api_token), timeout=timeout)
-    except requests.RequestException as e:
-        raise SourceError(f"coros-mcp unreachable while fetching "
-                          f"{label_id}: {e}") from e
-
-    if resp.status_code != 200:
-        message = None
-        try:
-            message = (resp.json() or {}).get("error")
-        except ValueError:
-            message = resp.text[:200]
-        raise SourceError(
-            f"coros-mcp returned HTTP {resp.status_code} for {label_id}: "
-            f"{message}")
+    resp = _get(base_url.rstrip("/") + FILE_PATH.format(label_id=label_id),
+                base_url, api_token, timeout,
+                params={"sport_type": sport_type, "file_type": "fit"},
+                what=f"the FIT file for {label_id}")
 
     content = resp.content
     if len(content) < 14 or content[8:12] != FIT_SIGNATURE:

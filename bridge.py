@@ -7,18 +7,18 @@ identity to a Garmin device the account owns, and uploads it to Garmin Connect
 so the record keeps advancing after the Garmin watch is retired. One-way,
 hourly from cron.
 
-    list  ──► COROS /activity/query           (CorosClient, from coros-mcp)
+    list  ──► coros-mcp   /api/v1/activities/live
     fetch ──► coros-mcp   /api/v1/activities/{id}/file
     edit  ──► fit-manager /api/v1/convert
     push  ──► garmin-mcp  /api/v1/upload/fit
     log   ──► bridge.db
 
-Three of the four hops are HTTP calls to services that already run on this
-machine, so the bridge holds no COROS export logic, no FIT editor and no
-Garmin session of its own. Only the listing reaches an API directly, because
-it must be live: coros-mcp's REST API serves a mirror that a downloader
-refreshes on its own schedule, and an activity recorded in the last hour —
-exactly what this run exists to catch — is not in it yet.
+Every hop is an HTTP call to a service that already runs on this machine, so
+the bridge holds no COROS export logic, no FIT editor, no Garmin session and
+no credentials of any kind. Both COROS hops answer from COROS itself rather
+than coros-mcp's local mirror, which a downloader refreshes on its own
+schedule: an activity recorded in the last hour — exactly what this run exists
+to catch — is not in that mirror yet.
 
 Every hop is idempotent and every outcome is written down before the next
 activity starts, so a killed run costs nothing and nothing is uploaded twice.
@@ -691,8 +691,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"   coros-mcp  : {cfg.coros_url} "
                   f"({coros_info.get('activities')} activities known)")
 
-        client = coros_source.connect()
-        activities = coros_source.list_activities(client, start_day, end_day)
+        activities = coros_source.list_activities(
+            start_day, end_day, cfg.coros_url, api_token=cfg.coros_api_token)
         counts["considered"] = len(activities)
         print(f"   COROS      : {len(activities)} activities in the window")
 

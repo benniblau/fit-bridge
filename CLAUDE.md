@@ -30,18 +30,26 @@ Four related projects, all on GitHub under `benniblau`, all deployed to
 
 | Project | Role here |
 |---|---|
-| `../coros-mcp` | Source. **Listing** imports `CorosClient` from `coros_downloader.py` — region discovery, token caching, `1019` re-login, retries. **Fetching the file** is an HTTP call to `GET /api/v1/activities/{label_id}/file` on port **8086**. |
+| `../coros-mcp` | Source, over HTTP on port **8086**. `GET /api/v1/activities/live` for the listing, `GET /api/v1/activities/{label_id}/file` for the bytes. It owns the COROS login, the shared token cache, region discovery, `1019` re-login and retries — none of which the bridge sees. |
 | `../garmin-mcp` | Destination. Owns the garth session, the upload call and the classification of Garmin's answer, behind `POST /api/v1/upload/fit` on port **8080**. The bridge holds no Garmin credentials. |
 | `../fit-manager` | Conversion service. Flask + gunicorn on port **7077**. The bridge calls it over HTTP; it does **not** import the editor. |
 | `../strava-mcp` | Not used, but relevant: if Garmin re-exports uploads to Strava, activities will duplicate there. |
 
-Three of the four hops are therefore HTTP calls to services already running on
-the host. Only the listing imports code, and it has to: coros-mcp's REST API
-serves a local mirror refreshed by a downloader on its own schedule, so an
-activity recorded in the last hour — exactly what an hourly run exists to
-catch — is not in it yet. Routing the listing through the mirror would put a
-sync's worth of latency in front of every upload and make the bridge fail
-whenever that sync did.
+**All four hops are HTTP calls to services already running on the host, and the
+bridge holds no credentials at all.** It imports nothing from a sibling
+checkout.
+
+Both COROS hops deliberately bypass coros-mcp's local mirror, which a
+downloader refreshes on its own schedule: an activity recorded in the last hour
+— exactly what an hourly run exists to catch — is not in it yet. `/api/v1/
+activities/live` proxies COROS's own list endpoint for that reason, and the
+file route takes an explicit `sport_type` for the same one, so an activity the
+mirror has never seen still exports.
+
+The earlier argument for keeping `CorosClient` imported here was that the REST
+API served the mirror. That was an argument against *that endpoint*, not
+against any endpoint — adding a live one removed the last credential from this
+repo, which is public.
 
 Service addresses come from `MCP_HOST` + `COROS_MCP_PORT` / `GARMIN_MCP_PORT`,
 which the deployed `.env` already carried; `BRIDGE_COROS_API_URL` and
@@ -174,15 +182,22 @@ survived for weeks.
 Not in the original design, and each one was arrived at the hard way.
 
 - **Every hop that needs domain knowledge is a service, not an import.** The
-  FIT editor was already behind fit-manager; the COROS export dance and the
-  Garmin upload followed on 2026-08-27. What this bought: one Garmin credential
-  store on the machine instead of two processes sharing a session file (the
-  hourly bridge could otherwise race the daily sync over it), one copy of the
-  two-hop signed-URL export, and a bridge venv that needs only `requests` and
-  `python-dotenv`. What it cost: the bridge now depends on two more services
-  being up, which is why all three are health-checked before a run does any
-  work. `coros_source.download_fit` verifies the `X-Coros-Sha256` header
-  against the bytes that arrived, because they now cross a network.
+  FIT editor was already behind fit-manager; the COROS export, the Garmin
+  upload and finally the COROS listing followed on 2026-08-27. What this
+  bought: one Garmin credential store on the machine instead of two processes
+  sharing a session file (the hourly bridge could otherwise race the daily sync
+  over it), one copy of the two-hop signed-URL export, **no credentials in this
+  public repo at all**, and a venv that needs only `requests` and
+  `python-dotenv`. What it cost: the bridge depends on three services being up,
+  which is why all three are health-checked before a run does any work.
+  `coros_source.download_fit` verifies the `X-Coros-Sha256` header against the
+  bytes that arrived, because they now cross a network.
+- **The `.env` holds two bearer tokens and no credentials.** They authorise the
+  bridge to coros-mcp and garmin-mcp and nothing else — neither is a COROS or
+  Garmin credential, and neither reaches either account directly. `COROS_USER`
+  mattered longer than it looked: it is the *cache key* for the shared token
+  file, not just a login field, so it was needed on every run and not only at
+  expiry. It is gone now along with the login itself.
 - **A service failing mid-run refunds the attempt it spent.** `count_attempt`
   runs before the attempt so a file that crashes the process cannot loop
   forever — but an activity that got no verdict because garmin-mcp was down

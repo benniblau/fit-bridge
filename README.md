@@ -11,7 +11,7 @@ Garmin Connect. One-way, COROS → Garmin, hourly from cron.
 cron (hourly)
    │
    ▼
-bridge.py ──► COROS API                     list new activities (live)
+bridge.py ──► coros-mcp   /api/v1/activities/live        list new activities
    ├───────► coros-mcp   /api/v1/activities/{id}/file    download FIT
    ├───────► fit-manager /api/v1/convert                 rewrite device identity
    ├───────► garmin-mcp  /api/v1/upload/fit              upload
@@ -21,12 +21,14 @@ bridge.py ──► COROS API                     list new activities (live)
 Every hop is idempotent and every outcome is recorded, so an interrupted run
 costs nothing and no activity is ever uploaded twice.
 
-Three of the four hops are HTTP calls to services already running on this
-machine, so the bridge holds no FIT editor, no COROS export logic and no Garmin
-session of its own. Only the listing reaches an API directly, and it must:
-`coros-mcp`'s REST API serves a local mirror that a downloader refreshes on its
-own schedule, and an activity recorded in the last hour — exactly what this run
-exists to catch — is not in it yet.
+Every hop is an HTTP call to a service already running on this machine, so the
+bridge holds no FIT editor, no COROS export logic, no Garmin session — and **no
+credentials of any kind**.
+
+Both COROS hops answer from COROS itself rather than `coros-mcp`'s local
+mirror, which a downloader refreshes on its own schedule: an activity recorded
+in the last hour, exactly what this run exists to catch, is not in that mirror
+yet. That is what `/api/v1/activities/live` is for.
 
 ## Before trusting it
 
@@ -49,17 +51,20 @@ a registered device on `device_info`, which a COROS file barely populates; see
 | File | Role |
 |---|---|
 | `bridge.py` | Cron entrypoint: window, selection, orchestration, state |
-| `coros_source.py` | Lists activities live (`CorosClient`); fetches FIT bytes from `coros-mcp` |
+| `coros_source.py` | HTTP client for `coros-mcp`: the live listing and the FIT bytes |
 | `converter.py` | HTTP client for `fit-manager` `/api/v1/convert` |
 | `garmin_sink.py` | HTTP client for `garmin-mcp` `/api/v1/upload/fit` |
 | `schema/schema_bridge.sql` | State database — the single source of truth |
 | `deploy/` | Optional systemd unit and timer, as an alternative to cron |
 
-Nothing is reimplemented that a sibling project already owns, and nothing that
-needs a credential is held here. The FIT editor stays in `fit-manager`, the
-COROS export dance in `coros-mcp`, the Garmin session in `garmin-mcp`; all
-three are reached over HTTP. Only `CorosClient` is imported, from
-`../coros-mcp`, because the listing has to be live.
+Nothing is reimplemented that a sibling project already owns, nothing is
+imported from a sibling checkout, and no credential is held here. The FIT
+editor stays in `fit-manager`, the COROS API in `coros-mcp`, the Garmin session
+in `garmin-mcp`; all three are reached over HTTP.
+
+The only secrets in `.env` are the two bearer tokens that authorise this bridge
+to those two services. Neither is a COROS or Garmin credential, and neither
+grants access to either account directly.
 
 The upload path is worth spelling out, because it moved: `garmin-mcp` owns the
 garth session, the `/upload-service/upload/fit` call and the classification of
@@ -90,7 +95,7 @@ attempt on every candidate in the window:
 | Service | Default port | Checked by |
 |---|---|---|
 | `fit-manager` | 7077 | `/api/v1/health` |
-| `coros-mcp` | 8080 | `/api/v1/health` |
+| `coros-mcp` | 8080 | `/api/v1/health` (its COROS login is probed by `/api/v1/upload/health`) |
 | `garmin-mcp` | 8080 | `/api/v1/upload/health`, which probes the Garmin session |
 
 Their addresses come from `MCP_HOST` plus `COROS_MCP_PORT` / `GARMIN_MCP_PORT`,
@@ -119,7 +124,9 @@ pause switch still holds for scheduled runs.
 
 ## How an activity moves
 
-1. **List** — every activity COROS reports between the cutoff and today.
+1. **List** — `GET coros-mcp /api/v1/activities/live`, every activity COROS
+   reports between the cutoff and today. The service walks every page, so a
+   short list means COROS had nothing more.
 2. **Filter** — drop anything already settled, anything below the start date,
    and any sport type in `BRIDGE_SKIP_SPORTS`.
 3. **Download** — `GET coros-mcp /api/v1/activities/{id}/file`, sha256 recorded
@@ -204,6 +211,6 @@ are still open.
 
 | Project | Role |
 |---|---|
-| [`coros-mcp`](https://github.com/benniblau/coros-mcp) | Source — `CorosClient` for listing, `/api/v1/activities/{id}/file` for the bytes |
+| [`coros-mcp`](https://github.com/benniblau/coros-mcp) | Source — `/api/v1/activities/live` for the listing, `/api/v1/activities/{id}/file` for the bytes. Owns the COROS login |
 | [`garmin-mcp`](https://github.com/benniblau/garmin-mcp) | Destination — owns the garth session and `/api/v1/upload/fit` |
 | [`fit-manager`](https://github.com/benniblau/fit-manager) | Conversion service on port 7077 |
