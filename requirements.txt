@@ -1,12 +1,17 @@
 # coros-garmin-bridge
 #
-# The COROS client comes from the coros-mcp checkout (COROS_MCP_PATH) and the
-# Garmin session handling from garmin-mcp (GARMIN_MCP_PATH), so their imports
-# have to resolve in this venv too — hence requests and garth here.
+# Deliberately small. Every hop that needs real domain knowledge is done by a
+# service over HTTP, so the only thing this venv has to be able to do is speak
+# HTTP and read a .env:
 #
-# The FIT editor is deliberately NOT a dependency: the device rewrite is done
-# over HTTP by fit-manager, so fitparse and crcmod are not needed.
+#   the FIT editor  -> fit-manager  /api/v1/convert      (no fitparse, no crcmod)
+#   the COROS export -> coros-mcp   /api/v1/activities/{id}/file
+#   the Garmin upload -> garmin-mcp /api/v1/upload/fit   (no garth, no session)
+#
+# The one exception is listing activities, which imports CorosClient from the
+# coros-mcp checkout (COROS_MCP_PATH) because it has to reach COROS live rather
+# than that project's synced mirror — hence requests, which CorosClient needs
+# too.
 
 requests>=2.31.0
 python-dotenv>=1.0.0
-garth>=0.4.0

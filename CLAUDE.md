@@ -30,10 +30,23 @@ Four related projects, all on GitHub under `benniblau`, all deployed to
 
 | Project | Role here |
 |---|---|
-| `../coros-mcp` | Source of activities. Import `CorosClient` from `coros_downloader.py` — it handles region discovery, token caching, `1019` re-login and retries. |
-| `../garmin-mcp` | Destination auth. Reuse the garth session in `.garth/` and the `authenticate()` function in `export_fit.py`. |
+| `../coros-mcp` | Source. **Listing** imports `CorosClient` from `coros_downloader.py` — region discovery, token caching, `1019` re-login, retries. **Fetching the file** is an HTTP call to `GET /api/v1/activities/{label_id}/file` on port **8086**. |
+| `../garmin-mcp` | Destination. Owns the garth session, the upload call and the classification of Garmin's answer, behind `POST /api/v1/upload/fit` on port **8080**. The bridge holds no Garmin credentials. |
 | `../fit-manager` | Conversion service. Flask + gunicorn on port **7077**. The bridge calls it over HTTP; it does **not** import the editor. |
 | `../strava-mcp` | Not used, but relevant: if Garmin re-exports uploads to Strava, activities will duplicate there. |
+
+Three of the four hops are therefore HTTP calls to services already running on
+the host. Only the listing imports code, and it has to: coros-mcp's REST API
+serves a local mirror refreshed by a downloader on its own schedule, so an
+activity recorded in the last hour — exactly what an hourly run exists to
+catch — is not in it yet. Routing the listing through the mirror would put a
+sync's worth of latency in front of every upload and make the bridge fail
+whenever that sync did.
+
+Service addresses come from `MCP_HOST` + `COROS_MCP_PORT` / `GARMIN_MCP_PORT`,
+which the deployed `.env` already carried; `BRIDGE_COROS_API_URL` and
+`BRIDGE_GARMIN_API_URL` override. Tokens fall back to `COROS_MCP_AUTH_TOKEN`
+and `GARMIN_MCP_AUTH_TOKEN` so one `.env` holds a single copy of each.
 
 ## Key facts established by prior investigation
 
@@ -87,6 +100,11 @@ the "verified" list at the bottom of this file used to claim.
 
 ### Garmin upload
 
+**This all lives in `../garmin-mcp/garmin_files.py` now**, behind
+`POST /api/v1/upload/fit`. The bridge no longer imports garth, holds no session
+and does no classification — `garmin_sink.py` is a thin HTTP client. Change
+this behaviour there, not here.
+
 - Endpoint: `POST /upload-service/upload/fit` on `https://connectapi.garmin.com`,
   multipart field `file`, Bearer auth (garth adds it with `api=True`).
 - **HTTP 409 means duplicate.** garth calls `raise_for_status()`, so a duplicate
@@ -95,6 +113,15 @@ the "verified" list at the bottom of this file used to claim.
   the human-readable reason is at `failures[0].messages[0]`.
 - `garth.upload()` needs a real file handle — a bare `BytesIO` fails because it
   reads `fp.name`.
+- garth's default timeout is **10 seconds for every request**, and it passes
+  that to requests itself — so a `timeout=` kwarg on `garth.client.post()`
+  collides with it and raises `TypeError`. Set it with
+  `garth.client.configure(timeout=...)` instead.
+
+The service's own contract, which is what the bridge actually sees: **200 for
+anything Garmin decided**, with `status` = `uploaded` | `duplicate` | `failed`;
+**4xx** for a bad request; **503** when Garmin never answered. Only the last is
+retryable, and only the last aborts a run.
 
 ### Garmin identifies an upload by (serial_number, time_created)
 
@@ -146,6 +173,23 @@ survived for weeks.
 
 Not in the original design, and each one was arrived at the hard way.
 
+- **Every hop that needs domain knowledge is a service, not an import.** The
+  FIT editor was already behind fit-manager; the COROS export dance and the
+  Garmin upload followed on 2026-08-27. What this bought: one Garmin credential
+  store on the machine instead of two processes sharing a session file (the
+  hourly bridge could otherwise race the daily sync over it), one copy of the
+  two-hop signed-URL export, and a bridge venv that needs only `requests` and
+  `python-dotenv`. What it cost: the bridge now depends on two more services
+  being up, which is why all three are health-checked before a run does any
+  work. `coros_source.download_fit` verifies the `X-Coros-Sha256` header
+  against the bytes that arrived, because they now cross a network.
+- **A service failing mid-run refunds the attempt it spent.** `count_attempt`
+  runs before the attempt so a file that crashes the process cannot loop
+  forever — but an activity that got no verdict because garmin-mcp was down
+  learned nothing about itself, and three unlucky hours in a row must not
+  exhaust it. `SinkError` is therefore the one exception to "process() never
+  raises": it propagates, `refund_attempt()` undoes the increment, and the run
+  aborts with the activity untouched.
 - **The conversion endpoint is `POST /api/v1/convert`** in
   `fit-manager` (blueprint `app/blueprints/api_v1.py`). It takes
   `manufacturer_id` + `product_id` (or `device_name`) plus `serial_number`,
@@ -170,9 +214,10 @@ Not in the original design, and each one was arrived at the hard way.
   is health-checked before any work, because a service that is down would
   otherwise burn one retry attempt on every candidate in the window.
 - **`export_fit.py` exits the process** at import time when garth is missing
-  and inside `authenticate()` when credentials are. `garmin_sink.authenticate()`
-  converts that `SystemExit` into a `SinkError`; without it the run dies past
-  every handler and leaves its `bridge_runs` row saying `running`.
+  and inside `authenticate()` when credentials are. That trap now belongs to
+  `garmin_files.authenticate()` in garmin-mcp, which converts the `SystemExit`
+  into an `UploadError` — otherwise a missing credential takes down the whole
+  MCP server, not just one request.
 
 ## Conventions to follow
 
@@ -301,9 +346,12 @@ switching `BRIDGE_ENABLED` on.
 ### Other things that surfaced during the test
 
 - `POST /upload-service/upload/fit` answers **202 with no import result**, so
-  `garmin_sink._classify()` takes its "Accepted with no import result reported"
-  branch and `garmin_activity_id` is **never populated**. The upload id is
-  recorded; the activity id is not. Resolving it needs a follow-up poll.
+  the classifier takes its "Accepted with no import result reported" branch and
+  `garmin_activity_id` is **never populated**. The upload id is recorded; the
+  activity id is not. Resolving it needs a follow-up poll. (That classifier is
+  `garmin_files._classify()` in garmin-mcp since 2026-08-27; it was
+  `garmin_sink._classify()` here.) Confirmed again on 2026-08-27: 202, upload
+  id `475376063944`, no activity id.
 - Garmin's activity list is briefly stale after a `DELETE` (204).
 - A deleted activity can be re-uploaded: all three attempts went through after
   deleting the previous one, with no 409.
@@ -311,7 +359,10 @@ switching `BRIDGE_ENABLED` on.
   `bridge.py --only … --force` against the patched converter, while the activity
   was already in Garmin, came back `duplicate` and not `failed`, and created no
   second copy — README verification step 3, previously only tested against
-  fakes.
+  fakes. Note what that does and does not prove: the 409 fired because the
+  re-uploaded file carried the *same* `(serial_number, time_created)` pair. A
+  file for the same run without that pair is not recognised as a duplicate at
+  all (see the fitfiletools note below).
 - The external device changer at fitfiletools.com/changer was compared against
   this implementation. It also adds `device_info.product`, but writes **no
   serial and no `device_index`** and leaves the "COROS VERTIX 2S" strings in
@@ -319,8 +370,26 @@ switching `BRIDGE_ENABLED` on.
   fields 73/78) and the session equivalents (124/125), which costs +19% file
   size and is semantically redundant — the FIT profile derives those from the
   legacy 16-bit `speed`/`altitude`, and the SDK reports identical values for the
-  unmodified COROS file. Whether its no-serial output is attributed correctly by
-  Garmin was **not tested**.
+  unmodified COROS file.
+
+  **Its output is NOT attributed correctly — tested 2026-08-27.** Uploading it
+  produced `{deviceId: "0", deviceTypePk: 19, deviceVersionPk: 80}` and
+  `manualActivity: True`: the excluded category, the same result as attempts 1
+  and 2 in the table above. The serial is what Garmin needs, and this tool does
+  not write one. The activity (`24137833590`) was deleted.
+
+  Two things fell out of that upload, both confirming the identity model:
+  Garmin did **not** answer 409 even though it already held a byte-equivalent
+  recording of the same run, because with no serial the
+  `(serial_number, time_created)` pair could not match — and a re-upload of an
+  activity Garmin already has is therefore *not* reliably a duplicate. It
+  depends entirely on that pair.
+
+  **`coros_modified_to_garmin.fit` in the repo root is this tool's output, not
+  the bridge's.** It is 209,013 bytes; converting the same recording through
+  `/api/v1/convert` gives 175,712 (the source is 175,689, +23 for the added
+  identity fields). Do not reach for that file as "the file Garmin accepted" —
+  it is the file Garmin filed as manual.
 - `Decoder.check_integrity()` consumes its `Stream`; call it on its own stream
   or a following `read()` silently returns nothing.
 

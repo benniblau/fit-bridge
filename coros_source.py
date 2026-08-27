@@ -2,17 +2,28 @@
 """
 COROS side of the bridge: list new activities and fetch their FIT files.
 
-Nothing here re-implements the COROS API. `CorosClient` from the coros-mcp
-checkout already owns regional host discovery, token caching, the 1019
-re-login path and per-request retries — this module imports it and adds only
-what the bridge needs on top: pagination over the activity list, and turning a
-signed export URL into bytes.
+The two halves reach COROS by deliberately different routes.
 
-The token cache is shared with coros-mcp on purpose, so the hourly bridge and
-the daily sync do not each hold their own session.
+**Listing** goes to COROS directly, through `CorosClient` from the coros-mcp
+checkout — which owns regional host discovery, token caching, the 1019
+re-login path and per-request retries. It has to be live: coros-mcp's REST API
+serves its local SQLite mirror, populated by a downloader on its own schedule,
+so an activity recorded in the last hour is not in it yet. The bridge runs
+hourly precisely to catch those, and routing the listing through the mirror
+would put a sync's worth of latency in front of every upload and make the
+bridge fail whenever that sync did.
+
+**Fetching the file** goes over HTTP to coros-mcp's
+`GET /api/v1/activities/{label_id}/file`, which is freshness-independent — it
+asks COROS for a signed export URL and follows it, whatever the mirror knows.
+The sport type is passed explicitly for exactly that reason: it comes from the
+live listing above, so an activity the mirror has never seen still exports.
+
+That leaves one copy of the two-hop export dance, in the project that owns the
+COROS API, rather than a second one here — the same reasoning that keeps the
+FIT editor in fit-manager and reaches it over HTTP.
 """
 
-import hashlib
 import os
 import sys
 from contextlib import contextmanager
@@ -25,15 +36,15 @@ import requests
 # sibling-directory default, overridable by environment variable.
 DEFAULT_COROS_MCP_PATH = Path(__file__).parent.parent / "coros-mcp"
 
-# COROS export file types; 4 is the original FIT recording.
-FILE_TYPE_FIT = 4
-
 # The list endpoint rejects sizes above 200.
 PAGE_SIZE = 200
 
-# A FIT file carries its signature at bytes 8..12. Signed COROS URLs answer
-# with XML on error, so this is what tells a real file from an error page.
+# A FIT file carries its signature at bytes 8..12. coros-mcp checks this too;
+# it is repeated here because the bytes crossed a network in between.
 FIT_SIGNATURE = b".FIT"
+
+FILE_PATH = "/api/v1/activities/{label_id}/file"
+HEALTH_PATH = "/api/v1/health"
 
 _client_module = None
 
@@ -62,7 +73,7 @@ class SourceError(RuntimeError):
 
 
 def connect() -> Any:
-    """Return an authenticated CorosClient."""
+    """Return an authenticated CorosClient, for listing."""
     module = _load_coros_module()
     try:
         client = module.CorosClient()
@@ -131,33 +142,75 @@ def summarize(activity: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def download_fit(client: Any, label_id: str, sport_type: int,
-                 timeout: int = 120) -> Tuple[bytes, str]:
-    """
-    Download one activity's original FIT file.
+def _headers(api_token: Optional[str]) -> Dict[str, str]:
+    return {"Authorization": f"Bearer {api_token}"} if api_token else {}
 
-    Returns (bytes, sha256). COROS answers /activity/detail/download with a
-    short-lived signed URL rather than the file itself, so this is two hops.
-    """
-    with _translated():
-        data = client.download_url(label_id, sport_type, FILE_TYPE_FIT)
-    url: Optional[str] = data.get("fileUrl")
-    if not url:
-        raise SourceError(f"COROS returned no fileUrl for {label_id}")
 
+def health(base_url: str, api_token: Optional[str] = None,
+           timeout: int = 10) -> dict:
+    """
+    Check the coros-mcp service before a run tries to fetch anything.
+
+    Unauthenticated on the server side, so this says the service is up, not
+    that the token is right — a wrong token surfaces on the first fetch.
+    """
     try:
-        resp = requests.get(url, timeout=timeout)
+        resp = requests.get(base_url.rstrip("/") + HEALTH_PATH, timeout=timeout)
     except requests.RequestException as e:
-        raise SourceError(f"Could not fetch the FIT file for {label_id}: {e}") from e
-
+        raise SourceError(f"coros-mcp unreachable at {base_url}: {e}") from e
     if resp.status_code != 200:
         raise SourceError(
-            f"Signed URL for {label_id} returned HTTP {resp.status_code}")
+            f"coros-mcp health check returned HTTP {resp.status_code}")
+    try:
+        return resp.json()
+    except ValueError:
+        raise SourceError("coros-mcp health check did not answer with JSON")
+
+
+def download_fit(label_id: str, sport_type: int, base_url: str,
+                 api_token: Optional[str] = None,
+                 timeout: int = 180) -> Tuple[bytes, str]:
+    """
+    Download one activity's original FIT file. Returns (bytes, sha256).
+
+    The sha256 comes from the service's X-Coros-Sha256 header when it is
+    present and is verified against the bytes that arrived, so a truncated
+    response is caught here rather than becoming a mysterious conversion
+    failure one hop later.
+    """
+    import hashlib
+
+    url = (base_url.rstrip("/")
+           + FILE_PATH.format(label_id=label_id))
+    try:
+        resp = requests.get(url, params={"sport_type": sport_type,
+                                         "file_type": "fit"},
+                            headers=_headers(api_token), timeout=timeout)
+    except requests.RequestException as e:
+        raise SourceError(f"coros-mcp unreachable while fetching "
+                          f"{label_id}: {e}") from e
+
+    if resp.status_code != 200:
+        message = None
+        try:
+            message = (resp.json() or {}).get("error")
+        except ValueError:
+            message = resp.text[:200]
+        raise SourceError(
+            f"coros-mcp returned HTTP {resp.status_code} for {label_id}: "
+            f"{message}")
 
     content = resp.content
     if len(content) < 14 or content[8:12] != FIT_SIGNATURE:
         raise SourceError(
-            f"Downloaded file for {label_id} is not a FIT file "
-            f"({len(content)} bytes, starts {content[:16]!r})")
+            f"coros-mcp returned something that is not a FIT file for "
+            f"{label_id} ({len(content)} bytes, starts {content[:16]!r})")
 
-    return content, hashlib.sha256(content).hexdigest()
+    digest = hashlib.sha256(content).hexdigest()
+    claimed = resp.headers.get("X-Coros-Sha256")
+    if claimed and claimed != digest:
+        raise SourceError(
+            f"FIT file for {label_id} arrived corrupted: coros-mcp sent "
+            f"{claimed}, {len(content)} bytes hash to {digest}")
+
+    return content, digest

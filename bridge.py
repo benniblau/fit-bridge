@@ -8,10 +8,17 @@ so the record keeps advancing after the Garmin watch is retired. One-way,
 hourly from cron.
 
     list  ──► COROS /activity/query           (CorosClient, from coros-mcp)
-    fetch ──► COROS /activity/detail/download → signed URL → bytes
+    fetch ──► coros-mcp   /api/v1/activities/{id}/file
     edit  ──► fit-manager /api/v1/convert
-    push  ──► Garmin /upload-service/upload/fit  (garth, session from garmin-mcp)
+    push  ──► garmin-mcp  /api/v1/upload/fit
     log   ──► bridge.db
+
+Three of the four hops are HTTP calls to services that already run on this
+machine, so the bridge holds no COROS export logic, no FIT editor and no
+Garmin session of its own. Only the listing reaches an API directly, because
+it must be live: coros-mcp's REST API serves a mirror that a downloader
+refreshes on its own schedule, and an activity recorded in the last hour —
+exactly what this run exists to catch — is not in it yet.
 
 Every hop is idempotent and every outcome is written down before the next
 activity starts, so a killed run costs nothing and nothing is uploaded twice.
@@ -102,6 +109,24 @@ def _env_int_set(name: str) -> Set[int]:
     return values
 
 
+def _service_url(explicit: str, host_var: str, port_var: str,
+                 default_port: int) -> str:
+    """
+    Where a sibling service lives.
+
+    An explicit BRIDGE_*_API_URL wins. Failing that the address is assembled
+    from MCP_HOST and the service's own port variable, which the sibling
+    projects already define and this machine's .env already carries — so the
+    two servers do not have to be spelled out twice in two different forms.
+    """
+    url = os.getenv(explicit, "").strip()
+    if url:
+        return url
+    host = os.getenv(host_var, "").strip() or "127.0.0.1"
+    port = os.getenv(port_var, "").strip() or str(default_port)
+    return f"http://{host}:{port}"
+
+
 def _yyyymmdd(d: date) -> int:
     return int(d.strftime("%Y%m%d"))
 
@@ -118,6 +143,10 @@ class Config:
     db_path: Path
     converter_url: str
     converter_api_key: Optional[str]
+    coros_url: str
+    coros_api_token: Optional[str]
+    garmin_url: str
+    garmin_api_token: Optional[str]
     manufacturer_id: int
     product_id: int
     serial_number: Optional[int]
@@ -150,6 +179,14 @@ class Config:
             converter_url=os.getenv("BRIDGE_CONVERTER_URL", "http://127.0.0.1:7077"),
             converter_api_key=(os.getenv("BRIDGE_CONVERTER_API_KEY")
                                or os.getenv("FIT_API_KEY")),
+            coros_url=_service_url("BRIDGE_COROS_API_URL", "MCP_HOST",
+                                   "COROS_MCP_PORT", 8080),
+            coros_api_token=(os.getenv("BRIDGE_COROS_API_TOKEN")
+                             or os.getenv("COROS_MCP_AUTH_TOKEN")),
+            garmin_url=_service_url("BRIDGE_GARMIN_API_URL", "MCP_HOST",
+                                    "GARMIN_MCP_PORT", 8080),
+            garmin_api_token=(os.getenv("BRIDGE_GARMIN_API_TOKEN")
+                              or os.getenv("GARMIN_MCP_AUTH_TOKEN")),
             manufacturer_id=_env_int("BRIDGE_MANUFACTURER_ID", DEFAULT_MANUFACTURER_ID),
             product_id=_env_int("BRIDGE_PRODUCT_ID", DEFAULT_PRODUCT_ID),
             serial_number=_env_int("BRIDGE_GARMIN_SERIAL",
@@ -214,6 +251,20 @@ def count_attempt(conn: sqlite3.Connection, label_id: str) -> None:
     """
     conn.execute(
         "UPDATE bridge_activities SET attempts = attempts + 1 "
+        "WHERE coros_label_id = ?", (label_id,))
+    conn.commit()
+
+
+def refund_attempt(conn: sqlite3.Connection, label_id: str) -> None:
+    """
+    Give back an attempt spent on a run a service aborted.
+
+    The counter exists to stop a bad *file* being retried forever. An activity
+    that never got a verdict because garmin-mcp was down learned nothing about
+    itself, and three unlucky hours in a row should not exhaust it.
+    """
+    conn.execute(
+        "UPDATE bridge_activities SET attempts = MAX(COALESCE(attempts, 0) - 1, 0) "
         "WHERE coros_label_id = ?", (label_id,))
     conn.commit()
 
@@ -418,13 +469,15 @@ def describe(summary: Dict[str, Any]) -> str:
 # The pipeline
 # ---------------------------------------------------------------------------
 
-def process(conn: sqlite3.Connection, cfg: Config, client: Any,
+def process(conn: sqlite3.Connection, cfg: Config,
             summary: Dict[str, Any]) -> str:
     """
     Download, convert, upload and record one activity.
 
-    Returns the status it ended in. Never raises: one activity failing must
-    not abort the run.
+    Returns the status it ended in. Raises only SinkError, which means the
+    upload service or Garmin behind it stopped answering — a verdict on the
+    run, not on this file. Every other failure belongs to the activity, and
+    one activity failing must not abort the run.
     """
     label = summary["label_id"]
     filename = f"{label}.fit"
@@ -432,8 +485,11 @@ def process(conn: sqlite3.Connection, cfg: Config, client: Any,
 
     source_sha = converted_sha = None
     try:
+        # The sport type comes from the live listing, so coros-mcp can export
+        # an activity its own database has not synced yet.
         raw, source_sha = coros_source.download_fit(
-            client, label, summary["sport_type"])
+            label, summary["sport_type"], cfg.coros_url,
+            api_token=cfg.coros_api_token)
         print(f"    📥 {len(raw):,} bytes from COROS")
 
         # The recording's start time is stamped into file_id.time_created,
@@ -461,7 +517,9 @@ def process(conn: sqlite3.Connection, cfg: Config, client: Any,
         print(f"    🔁 rewritten to manufacturer={cfg.manufacturer_id} "
               f"product={cfg.product_id} serial={cfg.serial_number}")
 
-        result = garmin_sink.upload_fit(converted, filename)
+        result = garmin_sink.upload_fit(
+            converted, filename, cfg.garmin_url,
+            api_token=cfg.garmin_api_token)
 
     except converter.ConversionError as e:
         set_outcome(conn, label, "failed", error=f"convert: {e}",
@@ -477,6 +535,11 @@ def process(conn: sqlite3.Connection, cfg: Config, client: Any,
         set_outcome(conn, label, "failed", error=f"download: {e}")
         print(f"    ❌ download failed: {e}")
         return "failed"
+    except garmin_sink.SinkError:
+        # Garmin never answered, so nothing is known about this file. Leave it
+        # exactly as it was and let the run abort; the next one picks it up.
+        refund_attempt(conn, label)
+        raise
     except Exception as e:                                        # noqa: BLE001
         set_outcome(conn, label, "failed", error=f"{type(e).__name__}: {e}",
                     source_sha=source_sha, converted_sha=converted_sha)
@@ -615,12 +678,18 @@ def main(argv: Optional[List[str]] = None) -> int:
               "failed": 0, "skipped": 0}
 
     try:
-        # Preflight the converter before touching anything. A service that is
-        # down would otherwise burn one retry attempt on every candidate.
+        # Preflight every service before touching anything. One that is down
+        # would otherwise burn a retry attempt on every candidate in turn.
+        # Garmin is probed too, and deliberately last: it is the slowest check
+        # and the only one that costs a round trip to a third party.
         if not args.dry_run:
             info = converter.health(cfg.converter_url, cfg.converter_api_key)
             print(f"   converter  : {cfg.converter_url} "
                   f"({info.get('device_count')} devices)")
+
+            coros_info = coros_source.health(cfg.coros_url, cfg.coros_api_token)
+            print(f"   coros-mcp  : {cfg.coros_url} "
+                  f"({coros_info.get('activities')} activities known)")
 
         client = coros_source.connect()
         activities = coros_source.list_activities(client, start_day, end_day)
@@ -682,11 +751,12 @@ def main(argv: Optional[List[str]] = None) -> int:
             finish_run(conn, run_id, counts, "ok")
             return 0
 
-        garmin_sink.authenticate()
+        garmin_sink.authenticate(cfg.garmin_url, cfg.garmin_api_token)
+        print(f"   garmin-mcp : {cfg.garmin_url} (session ready)")
 
         for n, s in enumerate(candidates, 1):
             print(f"\n[{n}/{len(candidates)}] {describe(s)}")
-            status = process(conn, cfg, client, s)
+            status = process(conn, cfg, s)
             counts[status] = counts.get(status, 0) + 1
             if n < len(candidates):
                 time.sleep(cfg.sleep_between)
