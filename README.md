@@ -179,10 +179,16 @@ Tested against a genuine COROS recording on 2026-08-20. Garmin accepts the
 upload and attributes it to the registered watch — same `deviceId` and
 `deviceTypePk` as that watch's own recordings, and not flagged manual.
 
-That attribution is the precondition the project rests on, but the **badge
-award itself has not been observed directly**: Garmin recomputes
-asynchronously, and its monthly challenges report `userJoined: false` until you
-join them. Confirm real badge progress before setting `BRIDGE_ENABLED=true`.
+**Confirmed on 2026-08-28: bridged activities count toward challenge
+progress.** Garmin's "2026 Running - Stage 3" challenge reported
+`badgeProgressValue = 270577.63` m; the sum of every running activity in that
+window is 270577.63 m across 24 activities, of which six — 56394.04 m — came
+from this bridge. Native recordings alone fall exactly that much short. All six
+also report `manualActivity: False` against the registered watch.
+
+Read `GET /badgechallenge-service/badgeChallenge/non-completed` for live
+progress. The earned-badge list clamps `badgeProgressValue` to the target and
+so cannot show what contributed.
 
 Getting there needed more than a `file_id` rewrite. Garmin matches an upload to
 a registered device on `device_info`, which a COROS file barely populates; see
@@ -201,8 +207,9 @@ already declares everything needed.
    no-re-export claim.
 5. Let one hourly cron run complete and inspect `bridge_runs`.
 
-Steps 1–3 were completed for COROS on 2026-08-20. Steps 4 and 5 are still open,
-and nothing has been confirmed end to end for Zwift.
+Steps 1–3 were completed for COROS on 2026-08-20, and step 2's "does it count?"
+was answered on 2026-08-28. Step 4 is still open, and nothing has been
+confirmed end to end for Zwift.
 
 ## Related projects
 

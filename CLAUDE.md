@@ -15,8 +15,9 @@ zwift.env` — each with its own state database, pause switch, start date and
 cap, so no bridge can lose another's activities or spend its retries.
 
 **Status: COROS bridge live on 10.10.1.224, `BRIDGE_ENABLED=true`, hourly from
-cron. Premise CONFIRMED on 2026-08-20; badge award itself still unconfirmed.
-Zwift bridge built and verified as far as conversion, never uploaded.**
+cron. Premise CONFIRMED on 2026-08-20 (attribution) and **2026-08-28 (badge
+progress — see below)**. Zwift bridge built and verified as far as conversion,
+never uploaded.**
 
 Garmin attributes an upload to a real device only when the file carries a
 Garmin-shaped `device_info` message; the `file_id` rewrite alone yields a
@@ -413,6 +414,43 @@ Remaining cosmetic gap: `deviceVersionPk` is 1004425 rather than 1014322,
 because the COROS file has no `file_creator` message. A real Fenix 8 file
 carries `file_creator{software_version: 2241}`. Adding it would make the two
 identical; it did not affect device attribution.
+
+### CONFIRMED 2026-08-28: bridged activities count toward challenge progress
+
+This is the question the whole project rests on, and it is now answered by
+arithmetic rather than inference.
+
+Garmin's challenge **"2026 Running - Stage 3"** (`2026-07-01 .. 2026-09-30`,
+target 300 km) reported `badgeProgressValue = 270577.63` m. The sum of every
+running activity in Garmin over that window is **270577.63 m across 24
+activities — an exact match to the centimetre.** Six of those 24, totalling
+**56394.04 m**, are activities this bridge uploaded from COROS. Native Fenix
+recordings alone come to 214183.59 m, which is 56394.04 m short of what Garmin
+reports.
+
+An exact match over 24 activities is not a coincidence, and the shortfall is
+exactly the bridged distance. **Garmin counts bridged uploads toward challenge
+progress.**
+
+Supporting: all six bridged activities report `manualActivity: False` and
+`deviceId: <the registered Fenix 8 unit id>` — the attribution precondition,
+holding for every one of them, not just the 2026-08-20 test.
+
+Read this endpoint, not the earned list, for evidence: `GET
+/badgechallenge-service/badgeChallenge/non-completed` carries live
+`badgeProgressValue` / `badgeTargetValue`. `/badge-service/badge/earned`
+reports completed badges with `badgeProgressValue` clamped to the target, which
+tells you nothing about what contributed.
+
+**"August Rundown" is NOT evidence, despite appearances.** It was earned
+`2026-08-23T09:25:36`, which is exactly the start of the 3.01 km bridged run
+that morning (11:25:36 CEST = 09:25:36 UTC) — but its 50-mile target had
+already been crossed on **2026-08-13** by native Fenix runs alone (cumulative
+82.42 km). The timestamp suggests a bridged activity *triggered* the award, but
+it cannot show the badge depended on bridged distance. Do not cite it.
+
+Also note `userJoined` is now **True** on the monthly challenges, contradicting
+the 2026-08-20 observation below that they were false and tracked nothing.
 
 ### Still to confirm
 
