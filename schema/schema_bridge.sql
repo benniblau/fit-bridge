@@ -1,4 +1,10 @@
--- coros-garmin-bridge state database
+-- fit-bridge state database
+--
+-- One database per bridge, not one shared across bridges. Each bridge gets its
+-- own pause switch, start date and cap, so its state, its retries and the blast
+-- radius of a bug stay its own. `sport` is the canonical name source.py maps
+-- every upstream vocabulary onto, because the device an activity is attributed
+-- to is chosen by sport.
 --
 -- The bridge is a cron job that may be killed at any point, so every activity
 -- carries its own outcome and nothing is inferred from "what the last run got
@@ -22,18 +28,20 @@
 -- ============================================================
 
 CREATE TABLE IF NOT EXISTS bridge_activities (
-    coros_label_id TEXT PRIMARY KEY,
-    coros_date INTEGER,              -- YYYYMMDD, as COROS reports it
-    coros_start_time INTEGER,        -- unix seconds, for overlap matching
+    source_activity_id TEXT PRIMARY KEY,
+    source_date INTEGER,             -- YYYYMMDD, as the source reports it
+    source_start_time INTEGER,       -- unix seconds, stamped into time_created
     name TEXT,
-    sport_type INTEGER,
+    sport_type TEXT,                 -- the upstream's own code or label
+    sport TEXT,                      -- canonical: running|cycling|swimming|…
     distance REAL,                   -- metres
     status TEXT NOT NULL,            -- pending|uploaded|duplicate|skipped|failed
+    device_product_id INTEGER,       -- the device this was attributed to
     garmin_upload_id TEXT,
     garmin_activity_id TEXT,
     attempts INTEGER DEFAULT 0,
     last_error TEXT,
-    source_sha256 TEXT,              -- FIT as downloaded from COROS
+    source_sha256 TEXT,              -- FIT as downloaded from the source
     converted_sha256 TEXT,           -- FIT as uploaded to Garmin
     first_seen_at TEXT,
     uploaded_at TEXT
@@ -42,13 +50,13 @@ CREATE TABLE IF NOT EXISTS bridge_activities (
 CREATE INDEX IF NOT EXISTS idx_bridge_activities_status
     ON bridge_activities(status);
 CREATE INDEX IF NOT EXISTS idx_bridge_activities_date
-    ON bridge_activities(coros_date);
+    ON bridge_activities(source_date);
 
 -- ============================================================
 -- Runs
 -- ============================================================
 
--- One row per invocation. `considered` counts the activities COROS returned
+-- One row per invocation. `considered` counts the activities the source returned
 -- inside the window; the others count what the run actually did.
 CREATE TABLE IF NOT EXISTS bridge_runs (
     run_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -75,8 +83,8 @@ DROP VIEW IF EXISTS v_bridge_status;
 CREATE VIEW v_bridge_status AS
 SELECT status,
        COUNT(*)                          AS activities,
-       MIN(coros_date)                   AS first_date,
-       MAX(coros_date)                   AS last_date,
+       MIN(source_date)                   AS first_date,
+       MAX(source_date)                   AS last_date,
        ROUND(SUM(distance) / 1000.0, 1)  AS total_km
 FROM bridge_activities
 GROUP BY status
@@ -84,10 +92,10 @@ ORDER BY activities DESC;
 
 DROP VIEW IF EXISTS v_bridge_activities;
 CREATE VIEW v_bridge_activities AS
-SELECT coros_label_id,
-       substr(CAST(coros_date AS TEXT), 1, 4) || '-' ||
-       substr(CAST(coros_date AS TEXT), 5, 2) || '-' ||
-       substr(CAST(coros_date AS TEXT), 7, 2)  AS date,
+SELECT source_activity_id,
+       substr(CAST(source_date AS TEXT), 1, 4) || '-' ||
+       substr(CAST(source_date AS TEXT), 5, 2) || '-' ||
+       substr(CAST(source_date AS TEXT), 7, 2)  AS date,
        name,
        sport_type,
        ROUND(distance / 1000.0, 2)             AS km,
@@ -97,16 +105,16 @@ SELECT coros_label_id,
        last_error,
        uploaded_at
 FROM bridge_activities
-ORDER BY coros_date DESC, coros_start_time DESC;
+ORDER BY source_date DESC, source_start_time DESC;
 
 -- Activities that need attention: retries exhausted, or stuck pending.
 DROP VIEW IF EXISTS v_bridge_failures;
 CREATE VIEW v_bridge_failures AS
-SELECT coros_label_id, coros_date, name, sport_type,
+SELECT source_activity_id, source_date, name, sport_type,
        status, attempts, last_error, first_seen_at
 FROM bridge_activities
 WHERE status IN ('failed', 'pending')
-ORDER BY coros_date DESC;
+ORDER BY source_date DESC;
 
 DROP VIEW IF EXISTS v_bridge_runs;
 CREATE VIEW v_bridge_runs AS

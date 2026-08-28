@@ -1,44 +1,55 @@
 #!/usr/bin/env python3
 """
-COROS → Garmin activity bridge.
+fit-bridge — carry activities from one service into Garmin Connect.
 
-Pulls each new COROS activity as a FIT file, rewrites its recording-device
-identity to a Garmin device the account owns, and uploads it to Garmin Connect
-so the record keeps advancing after the Garmin watch is retired. One-way,
-hourly from cron.
+Garmin only counts activities recorded on Garmin devices toward badges and
+challenges. This pulls each new activity from a source as a FIT file, rewrites
+its recording-device identity to a Garmin device the account actually owns, and
+uploads it. One-way, source → Garmin, hourly from cron.
 
-    list  ──► coros-mcp   /api/v1/activities/live
-    fetch ──► coros-mcp   /api/v1/activities/{id}/file
-    edit  ──► fit-manager /api/v1/convert
-    push  ──► garmin-mcp  /api/v1/upload/fit
-    log   ──► bridge.db
+    list  ──► <source>-mcp /api/v1/activities/live
+    fetch ──► <source>-mcp /api/v1/activities/{id}/file
+    edit  ──► fit-manager  /api/v1/convert
+    push  ──► garmin-mcp   /api/v1/upload/fit
+    log   ──► <source>.db
 
 Every hop is an HTTP call to a service that already runs on this machine, so
-the bridge holds no COROS export logic, no FIT editor, no Garmin session and
-no credentials of any kind. Both COROS hops answer from COROS itself rather
-than coros-mcp's local mirror, which a downloader refreshes on its own
-schedule: an activity recorded in the last hour — exactly what this run exists
-to catch — is not in that mirror yet.
+this holds no upstream API logic, no FIT editor, no Garmin session and no
+credentials of any kind. Both source hops answer from the upstream itself
+rather than that project's local mirror, which a downloader refreshes on its
+own schedule: an activity recorded in the last hour — exactly what an hourly
+run exists to catch — is not in that mirror yet.
+
+ONE INSTANCE PER BRIDGE. `--config coros.env` and `--config zwift.env` run the
+same code against different sources, each with its own state database, pause
+switch, start date and cap. Nothing is shared, so one bridge cannot lose
+another's activities or spend its retries. Adding a source means adding an
+entry to source.py's SOURCES, not touching this file.
+
+The device is chosen per activity by canonical sport, because a bridge can
+carry more than one kind: a Zwift ride should arrive as the Edge, a Zwift run
+as the watch, and claiming a bike computer recorded a run is exactly the sort
+of incoherence Garmin can be expected to discard.
 
 Every hop is idempotent and every outcome is written down before the next
 activity starts, so a killed run costs nothing and nothing is uploaded twice.
 
 Safety, in the order it bites:
 
-    BRIDGE_ENABLED=false     every scheduled run is a no-op. This is how the
+    BRIDGE_ENABLED=false     every scheduled run is a no-op. This is how a
                              bridge stays paused while cron is already
                              installed.
     BRIDGE_START_DATE        hard floor. Nothing older is ever uploaded, which
-                             is what stops the bridge backfilling Garmin's own
-                             history back into Garmin.
+                             is what stops a bridge backfilling years of
+                             history into Garmin.
     BRIDGE_MAX_PER_RUN       bounds the blast radius of a bug.
     terminal states          uploaded / duplicate / skipped are never retried.
 
 Usage:
-    python bridge.py                      # a normal hourly run
-    python bridge.py --dry-run            # list candidates, touch nothing
-    python bridge.py --only <label_id>    # exactly one activity
-    python bridge.py --status             # what the database knows
+    python bridge.py --config coros.env            # a normal hourly run
+    python bridge.py --config zwift.env --dry-run  # list candidates only
+    python bridge.py --config zwift.env --only <id>
+    python bridge.py --config coros.env --status
 """
 
 import argparse
@@ -54,10 +65,19 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from dotenv import load_dotenv
 
 import converter
-import coros_source
 import garmin_sink
+import source as sources
 
-load_dotenv()
+# The config file is read before anything else looks at the environment, so
+# --config picks the bridge. Without one, a plain .env still works.
+_CONFIG_FLAG = "--config"
+if _CONFIG_FLAG in sys.argv:
+    _cfg_path = Path(sys.argv[sys.argv.index(_CONFIG_FLAG) + 1])
+    if not _cfg_path.is_file():
+        raise SystemExit(f"❌ No such config file: {_cfg_path}")
+    load_dotenv(_cfg_path, override=True)
+else:
+    load_dotenv()
 
 BASE = Path(__file__).parent
 SCHEMA_PATH = BASE / "schema" / "schema_bridge.sql"
@@ -66,9 +86,8 @@ DEFAULT_DB_PATH = BASE / "bridge.db"
 # Never reprocessed. See schema/schema_bridge.sql for what each one means.
 TERMINAL_STATES = ("uploaded", "duplicate", "skipped")
 
-# Benni's Fenix 8. The serial is preserved so Garmin sees a device that is
-# actually registered to the account; the manufacturer/product pair is what
-# makes it a Garmin recording at all.
+# The manufacturer/product pair is what makes an upload a Garmin recording at
+# all; the serial is what makes it a device Garmin can find on the account.
 DEFAULT_MANUFACTURER_ID = 1        # garmin
 DEFAULT_PRODUCT_ID = 4536          # fenix_8
 
@@ -94,19 +113,68 @@ def _env_int(name: str, default: Optional[int]) -> Optional[int]:
         raise SystemExit(f"❌ {name} must be an integer, got {raw!r}")
 
 
-def _env_int_set(name: str) -> Set[int]:
+def _env_str_set(name: str) -> Set[str]:
+    """
+    A comma-separated set of canonical sport names.
+
+    Was a set of COROS integer sport codes. Names travel across sources —
+    "cycling" means the same thing whoever recorded it — and a bridge that
+    skips strength work should not have to know each upstream's numbering.
+    """
     raw = os.getenv(name, "")
-    values = set()
-    for part in raw.replace(";", ",").split(","):
-        part = part.strip()
-        if not part:
-            continue
-        try:
-            values.add(int(part))
-        except ValueError:
-            raise SystemExit(f"❌ {name} must be a comma-separated list of "
-                             f"sport type ids, got {part!r}")
+    values = {part.strip().lower()
+              for part in raw.replace(";", ",").split(",") if part.strip()}
+    unknown = values - {sources.RUNNING, sources.CYCLING, sources.SWIMMING,
+                        sources.WALKING, sources.GYM, sources.SNOW,
+                        sources.WATER, sources.CLIMB, sources.OTHER}
+    if unknown:
+        raise SystemExit(f"❌ {name} has unknown sport(s): "
+                         f"{', '.join(sorted(unknown))}")
     return values
+
+
+@dataclass(frozen=True)
+class Device:
+    """A Garmin device an activity can be attributed to."""
+    product_id: int
+    serial_number: Optional[int]
+
+    def __str__(self) -> str:
+        return f"product={self.product_id} serial={self.serial_number}"
+
+
+def _parse_device(raw: str, var: str) -> Device:
+    """`product_id:serial_number`, e.g. 2713:3330008244."""
+    parts = [p.strip() for p in raw.split(":")]
+    if len(parts) != 2 or not all(parts):
+        raise SystemExit(f"❌ {var} must be product_id:serial_number, "
+                         f"got {raw!r}")
+    try:
+        return Device(int(parts[0]), int(parts[1]))
+    except ValueError:
+        raise SystemExit(f"❌ {var} must be two integers separated by a colon, "
+                         f"got {raw!r}")
+
+
+def _device_map(default: Device) -> Dict[str, Device]:
+    """
+    Per-sport device overrides, from BRIDGE_DEVICE_<SPORT>.
+
+    A bridge can carry more than one kind of activity, and the device has to
+    match it: a Zwift ride should arrive as the Edge and a Zwift run as the
+    watch. Claiming a bike computer recorded a run is the sort of incoherence
+    Garmin can be expected to discard, and it would be invisible here — the
+    upload would look like every other success.
+    """
+    out: Dict[str, Device] = {}
+    for sport in (sources.RUNNING, sources.CYCLING, sources.SWIMMING,
+                  sources.WALKING, sources.GYM, sources.SNOW,
+                  sources.WATER, sources.CLIMB, sources.OTHER):
+        var = f"BRIDGE_DEVICE_{sport.upper()}"
+        raw = os.getenv(var, "").strip()
+        if raw:
+            out[sport] = _parse_device(raw, var)
+    return out
 
 
 def _service_url(explicit: str, host_var: str, port_var: str,
@@ -143,18 +211,25 @@ class Config:
     db_path: Path
     converter_url: str
     converter_api_key: Optional[str]
-    coros_url: str
-    coros_api_token: Optional[str]
+    source: "sources.Source"
+    source_url: str
+    source_api_token: Optional[str]
     garmin_url: str
     garmin_api_token: Optional[str]
     manufacturer_id: int
-    product_id: int
-    serial_number: Optional[int]
+    default_device: Device
     max_per_run: int
     max_attempts: int
     lookback_days: int
-    skip_sports: Set[int] = field(default_factory=set)
+    # Per-sport overrides of default_device. Defaulted, so it sits with the
+    # other optional fields rather than in the middle of the required ones.
+    devices: Dict[str, Device] = field(default_factory=dict)
+    skip_sports: Set[str] = field(default_factory=set)
     sleep_between: float = 2.0
+
+    def device_for(self, sport: Optional[str]) -> Device:
+        """The device an activity of this sport is attributed to."""
+        return self.devices.get(sport or "", self.default_device)
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -172,29 +247,43 @@ class Config:
             raise SystemExit(f"❌ BRIDGE_START_DATE must be YYYY-MM-DD, "
                              f"got {raw_start!r}")
 
+        source_name = os.getenv("BRIDGE_SOURCE", "coros").strip().lower()
+        src = sources.get(source_name)
+
+        default_device = Device(
+            product_id=_env_int("BRIDGE_PRODUCT_ID", DEFAULT_PRODUCT_ID),
+            serial_number=_env_int("BRIDGE_GARMIN_SERIAL",
+                                   _env_int("GARMIN_SERIAL", None)),
+        )
+
+        # The state database defaults to one per source, so two bridges sharing
+        # a directory cannot end up sharing a ledger and losing each other's
+        # activities to a primary-key collision.
+        db_default = BASE / f"{source_name}.db"
+
         return cls(
             enabled=_env_bool("BRIDGE_ENABLED", False),
             start_date=start_date,
-            db_path=Path(os.getenv("BRIDGE_DB_PATH", str(DEFAULT_DB_PATH))),
+            db_path=Path(os.getenv("BRIDGE_DB_PATH", str(db_default))),
             converter_url=os.getenv("BRIDGE_CONVERTER_URL", "http://127.0.0.1:7077"),
             converter_api_key=(os.getenv("BRIDGE_CONVERTER_API_KEY")
                                or os.getenv("FIT_API_KEY")),
-            coros_url=_service_url("BRIDGE_COROS_API_URL", "MCP_HOST",
-                                   "COROS_MCP_PORT", 8080),
-            coros_api_token=(os.getenv("BRIDGE_COROS_API_TOKEN")
-                             or os.getenv("COROS_MCP_AUTH_TOKEN")),
+            source=src,
+            source_url=_service_url(src.url_var, "MCP_HOST",
+                                    src.port_var, src.default_port),
+            source_api_token=next(
+                (v for v in (os.getenv(n) for n in src.token_vars) if v), None),
             garmin_url=_service_url("BRIDGE_GARMIN_API_URL", "MCP_HOST",
                                     "GARMIN_MCP_PORT", 8080),
             garmin_api_token=(os.getenv("BRIDGE_GARMIN_API_TOKEN")
                               or os.getenv("GARMIN_MCP_AUTH_TOKEN")),
             manufacturer_id=_env_int("BRIDGE_MANUFACTURER_ID", DEFAULT_MANUFACTURER_ID),
-            product_id=_env_int("BRIDGE_PRODUCT_ID", DEFAULT_PRODUCT_ID),
-            serial_number=_env_int("BRIDGE_GARMIN_SERIAL",
-                                   _env_int("GARMIN_SERIAL", None)),
+            default_device=default_device,
+            devices=_device_map(default_device),
             max_per_run=_env_int("BRIDGE_MAX_PER_RUN", 10),
             max_attempts=_env_int("BRIDGE_MAX_ATTEMPTS", 3),
             lookback_days=_env_int("BRIDGE_LOOKBACK_DAYS", 2),
-            skip_sports=_env_int_set("BRIDGE_SKIP_SPORTS"),
+            skip_sports=_env_str_set("BRIDGE_SKIP_SPORTS"),
             sleep_between=float(os.getenv("BRIDGE_SLEEP_BETWEEN", "2")),
         )
 
@@ -203,11 +292,66 @@ class Config:
 # State database
 # ---------------------------------------------------------------------------
 
+# The columns that were named for COROS before this carried more than one
+# source, and what they are called now.
+_RENAMED_COLUMNS = {
+    "coros_label_id": "source_activity_id",
+    "coros_date": "source_date",
+    "coros_start_time": "source_start_time",
+}
+
+# Added after the first databases existed. CREATE TABLE IF NOT EXISTS will not
+# add a column to a table that is already there, so these are explicit.
+_ADDED_COLUMNS = {
+    "sport": "TEXT",
+    "device_product_id": "INTEGER",
+}
+
+
+def _migrate(conn: sqlite3.Connection) -> List[str]:
+    """
+    Bring an existing database up to the current schema. Returns what changed.
+
+    Runs before the schema script, because that script's indexes and views name
+    the new columns and would fail against the old shape. Idempotent: every step
+    checks what is actually there rather than tracking a version number, so a
+    fresh database and a three-times-migrated one end up identical.
+    """
+    have = {r["name"] for r in conn.execute("PRAGMA table_info(bridge_activities)")}
+    if not have:
+        return []                              # fresh database, nothing to move
+
+    done: List[str] = []
+    for old_name, new_name in _RENAMED_COLUMNS.items():
+        if old_name in have and new_name not in have:
+            # Views reference the old names; drop them and let the schema
+            # script recreate them, as the project's convention already does.
+            for (view,) in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'view'").fetchall():
+                conn.execute(f"DROP VIEW IF EXISTS {view}")
+            conn.execute(f"ALTER TABLE bridge_activities "
+                         f"RENAME COLUMN {old_name} TO {new_name}")
+            done.append(f"{old_name} → {new_name}")
+
+    have = {r["name"] for r in conn.execute("PRAGMA table_info(bridge_activities)")}
+    for name, decl in _ADDED_COLUMNS.items():
+        if name not in have:
+            conn.execute(f"ALTER TABLE bridge_activities ADD COLUMN {name} {decl}")
+            done.append(f"+{name}")
+
+    if done:
+        conn.commit()
+    return done
+
+
 def init_db(db_path: Path) -> sqlite3.Connection:
     """Open the state database, creating or upgrading it from the schema."""
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
+    changed = _migrate(conn)
+    if changed:
+        print(f"   migrated {db_path.name}: {', '.join(changed)}")
     conn.executescript(SCHEMA_PATH.read_text())
     conn.commit()
     return conn
@@ -215,29 +359,31 @@ def init_db(db_path: Path) -> sqlite3.Connection:
 
 def load_states(conn: sqlite3.Connection) -> Dict[str, sqlite3.Row]:
     rows = conn.execute("SELECT * FROM bridge_activities").fetchall()
-    return {row["coros_label_id"]: row for row in rows}
+    return {row["source_activity_id"]: row for row in rows}
 
 
 def remember(conn: sqlite3.Connection, summary: Dict[str, Any]) -> None:
     """
     Record an activity as seen, without disturbing an outcome it already has.
 
-    The metadata is refreshed every time because COROS renames activities and
-    revises distances after import.
+    The metadata is refreshed every time because sources rename activities and
+    revise distances after the fact — COROS geocodes a title on import.
     """
     conn.execute(
         """INSERT INTO bridge_activities (
-               coros_label_id, coros_date, coros_start_time, name, sport_type,
-               distance, status, attempts, first_seen_at)
-           VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?)
-           ON CONFLICT(coros_label_id) DO UPDATE SET
-               coros_date       = excluded.coros_date,
-               coros_start_time = excluded.coros_start_time,
-               name             = excluded.name,
-               sport_type       = excluded.sport_type,
-               distance         = excluded.distance""",
-        (summary["label_id"], summary["date"], summary["start_time"],
-         summary["name"], summary["sport_type"], summary["distance"], _now()),
+               source_activity_id, source_date, source_start_time, name,
+               sport_type, sport, distance, status, attempts, first_seen_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?)
+           ON CONFLICT(source_activity_id) DO UPDATE SET
+               source_date       = excluded.source_date,
+               source_start_time = excluded.source_start_time,
+               name              = excluded.name,
+               sport_type        = excluded.sport_type,
+               sport             = excluded.sport,
+               distance          = excluded.distance""",
+        (summary["activity_id"], summary["date"], summary["start_time"],
+         summary["name"], str(summary["raw_sport"]), summary["sport"],
+         summary["distance"], _now()),
     )
     conn.commit()
 
@@ -251,7 +397,7 @@ def count_attempt(conn: sqlite3.Connection, label_id: str) -> None:
     """
     conn.execute(
         "UPDATE bridge_activities SET attempts = attempts + 1 "
-        "WHERE coros_label_id = ?", (label_id,))
+        "WHERE source_activity_id = ?", (label_id,))
     conn.commit()
 
 
@@ -265,7 +411,7 @@ def refund_attempt(conn: sqlite3.Connection, label_id: str) -> None:
     """
     conn.execute(
         "UPDATE bridge_activities SET attempts = MAX(COALESCE(attempts, 0) - 1, 0) "
-        "WHERE coros_label_id = ?", (label_id,))
+        "WHERE source_activity_id = ?", (label_id,))
     conn.commit()
 
 
@@ -273,7 +419,7 @@ def park(conn: sqlite3.Connection, label_id: str, attempts: int) -> None:
     """Spend an activity's remaining attempts, for a failure that will repeat."""
     conn.execute(
         "UPDATE bridge_activities SET attempts = MAX(attempts, ?) "
-        "WHERE coros_label_id = ?", (attempts, label_id))
+        "WHERE source_activity_id = ?", (attempts, label_id))
     conn.commit()
 
 
@@ -294,7 +440,7 @@ def set_outcome(conn: sqlite3.Connection, label_id: str, status: str,
                uploaded_at        = CASE WHEN ? IN ('uploaded', 'duplicate')
                                          THEN COALESCE(uploaded_at, ?)
                                          ELSE uploaded_at END
-           WHERE coros_label_id = ?""",
+           WHERE source_activity_id = ?""",
         (status, upload_id, activity_id, error, source_sha, converted_sha,
          status, _now(), label_id),
     )
@@ -380,7 +526,7 @@ def compute_cutoff(conn: sqlite3.Connection, cfg: Config) -> date:
                          last.date() - timedelta(days=cfg.lookback_days))
 
     row = conn.execute(
-        """SELECT MIN(coros_date) AS oldest FROM bridge_activities
+        """SELECT MIN(source_date) AS oldest FROM bridge_activities
            WHERE status = 'pending'
               OR (status = 'failed' AND COALESCE(attempts, 0) < ?)""",
         (cfg.max_attempts,)).fetchone()
@@ -399,15 +545,14 @@ def compute_cutoff(conn: sqlite3.Connection, cfg: Config) -> date:
 def in_scope(activities: List[Dict[str, Any]], cfg: Config
              ) -> Tuple[List[Dict[str, Any]], int]:
     """
-    Summarize what COROS reported, dropping anything below the hard floor.
+    Drop anything below the hard floor.
 
-    The query is already bounded by the same floor, but COROS decides what a
-    date range means, so it is enforced again here.
+    The query is already bounded by the same floor, but the upstream decides
+    what a date range means, so it is enforced again here.
     """
     floor = _yyyymmdd(cfg.start_date)
     kept, rejected = [], 0
-    for raw in activities:
-        summary = coros_source.summarize(raw)
+    for summary in activities:
         if summary["date"] and summary["date"] < floor:
             rejected += 1
             continue
@@ -431,7 +576,7 @@ def select(summaries: List[Dict[str, Any]], states: Dict[str, sqlite3.Row],
                                "other_activity": 0}
 
     for summary in summaries:
-        label = summary["label_id"]
+        label = summary["activity_id"]
 
         if only and label != only:
             reasons["other_activity"] += 1
@@ -447,7 +592,7 @@ def select(summaries: List[Dict[str, Any]], states: Dict[str, sqlite3.Row],
                 reasons["exhausted"] += 1
                 continue
 
-        if summary["sport_type"] in cfg.skip_sports:
+        if summary["sport"] in cfg.skip_sports:
             to_skip.append(summary)
             continue
 
@@ -460,9 +605,9 @@ def select(summaries: List[Dict[str, Any]], states: Dict[str, sqlite3.Row],
 
 def describe(summary: Dict[str, Any]) -> str:
     km = (summary["distance"] or 0) / 1000.0
-    return (f"{summary['date']} {summary['label_id']} "
-            f"{(summary['name'] or '—')[:40]:<40} "
-            f"{km:6.2f} km  sport={summary['sport_type']}")
+    return (f"{summary['date']} {summary['activity_id']} "
+            f"{(summary['name'] or '—')[:36]:<36} "
+            f"{km:6.2f} km  {summary['sport']}")
 
 
 # ---------------------------------------------------------------------------
@@ -479,18 +624,19 @@ def process(conn: sqlite3.Connection, cfg: Config,
     run, not on this file. Every other failure belongs to the activity, and
     one activity failing must not abort the run.
     """
-    label = summary["label_id"]
+    label = summary["activity_id"]
     filename = f"{label}.fit"
     count_attempt(conn, label)
 
     source_sha = converted_sha = None
     try:
-        # The sport type comes from the live listing, so coros-mcp can export
-        # an activity its own database has not synced yet.
-        raw, source_sha = coros_source.download_fit(
-            label, summary["sport_type"], cfg.coros_url,
-            api_token=cfg.coros_api_token)
-        print(f"    📥 {len(raw):,} bytes from COROS")
+        # The source adapter supplies whatever its file route needs to reach an
+        # activity the mirror has not synced yet — a sport type for COROS, a
+        # bucket and key for Zwift.
+        raw, source_sha = sources.download_fit(
+            cfg.source, summary, cfg.source_url,
+            api_token=cfg.source_api_token)
+        print(f"    📥 {len(raw):,} bytes from {cfg.source.name}")
 
         # The recording's start time is stamped into file_id.time_created,
         # because Garmin identifies an upload by that together with the serial.
@@ -503,19 +649,24 @@ def process(conn: sqlite3.Connection, cfg: Config,
         # of three on 2026-08-23.
         start_time = summary.get("start_time")
         if not start_time:
-            print("    ⚠️  no start time from COROS — uploading with the file's "
-                  "own timestamp, which may collide with a sibling activity")
+            print(f"    ⚠️  no start time from {cfg.source.name} — uploading "
+                  "with the file's own timestamp, which may collide with a "
+                  "sibling activity")
+
+        # The device is chosen by sport: a ride must not arrive claiming a
+        # watch, nor a run claiming a bike computer.
+        device = cfg.device_for(summary["sport"])
 
         converted, converted_sha = converter.convert(
             raw, filename, cfg.converter_url,
             manufacturer_id=cfg.manufacturer_id,
-            product_id=cfg.product_id,
-            serial_number=cfg.serial_number,
+            product_id=device.product_id,
+            serial_number=device.serial_number,
             time_created=start_time or None,
             api_key=cfg.converter_api_key,
         )
         print(f"    🔁 rewritten to manufacturer={cfg.manufacturer_id} "
-              f"product={cfg.product_id} serial={cfg.serial_number}")
+              f"{device}  ({summary['sport']})")
 
         result = garmin_sink.upload_fit(
             converted, filename, cfg.garmin_url,
@@ -531,7 +682,7 @@ def process(conn: sqlite3.Connection, cfg: Config,
             park(conn, label, cfg.max_attempts)
             print("       (not retryable — parked for inspection)")
         return "failed"
-    except coros_source.SourceError as e:
+    except sources.SourceError as e:
         set_outcome(conn, label, "failed", error=f"download: {e}")
         print(f"    ❌ download failed: {e}")
         return "failed"
@@ -551,6 +702,9 @@ def process(conn: sqlite3.Connection, cfg: Config,
                 activity_id=result.activity_id,
                 error=None if result.status == "uploaded" else result.message,
                 source_sha=source_sha, converted_sha=converted_sha)
+    conn.execute("UPDATE bridge_activities SET device_product_id = ? "
+                 "WHERE source_activity_id = ?", (device.product_id, label))
+    conn.commit()
 
     if result.status == "uploaded":
         print(f"    ✅ uploaded — Garmin activity {result.activity_id}")
@@ -567,12 +721,17 @@ def process(conn: sqlite3.Connection, cfg: Config,
 
 def print_status(conn: sqlite3.Connection, cfg: Config) -> None:
     """What the database knows, for a human checking on the bridge."""
-    print("📦 coros-garmin-bridge state")
+    print(f"📦 fit-bridge {cfg.source.name} → garmin")
     print(f"   database   : {cfg.db_path}")
     print(f"   enabled    : {cfg.enabled}")
     print(f"   start date : {cfg.start_date}")
-    print(f"   device     : manufacturer={cfg.manufacturer_id} "
-          f"product={cfg.product_id} serial={cfg.serial_number}")
+    print(f"   source     : {cfg.source_url}")
+    print(f"   device     : manufacturer={cfg.manufacturer_id}, "
+          f"{cfg.default_device} by default")
+    for sport, device in sorted(cfg.devices.items()):
+        print(f"                {sport:<10} {device}")
+    if cfg.skip_sports:
+        print(f"   skipping   : {', '.join(sorted(cfg.skip_sports))}")
 
     rows = conn.execute("SELECT * FROM v_bridge_status").fetchall()
     if not rows:
@@ -588,7 +747,7 @@ def print_status(conn: sqlite3.Connection, cfg: Config) -> None:
     if failures:
         print("\n   needs attention:")
         for r in failures:
-            print(f"   ⚠️  {r['coros_date']} {r['coros_label_id']} "
+            print(f"   ⚠️  {r['source_date']} {r['source_activity_id']} "
                   f"[{r['status']}, {r['attempts']} attempts] "
                   f"{(r['last_error'] or '')[:80]}")
 
@@ -609,11 +768,15 @@ def print_status(conn: sqlite3.Connection, cfg: Config) -> None:
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Bridge new COROS activities into Garmin Connect")
+        description="Bridge new activities from a source into Garmin Connect")
+    p.add_argument("--config", metavar="FILE", default=None,
+                   help="Env file selecting the bridge, e.g. coros.env or "
+                        "zwift.env. Read before anything else looks at the "
+                        "environment; without one, a plain .env is used")
     p.add_argument("--dry-run", action="store_true",
                    help="List what would be processed; touch nothing")
-    p.add_argument("--only", metavar="LABEL_ID",
-                   help="Process exactly one COROS activity")
+    p.add_argument("--only", metavar="ACTIVITY_ID",
+                   help="Process exactly one activity")
     p.add_argument("--force", action="store_true",
                    help="With --only: reprocess an activity that is already "
                         "settled, and act even when BRIDGE_ENABLED is false")
@@ -650,13 +813,17 @@ def main(argv: Optional[List[str]] = None) -> int:
                   f"explicitly named activity ({args.only})")
         else:
             print("⏸  BRIDGE_ENABLED=false — nothing to do.")
-            print("   Set BRIDGE_ENABLED=true once the Garmin watch is retired,")
-            print("   or use --only <label_id> --force for a single manual run.")
+            print("   Set BRIDGE_ENABLED=true to start bridging,")
+            print("   or use --only <activity_id> --force for a single run.")
             return 0
 
-    if cfg.serial_number is None:
-        print("⚠️  BRIDGE_GARMIN_SERIAL is unset — the upload will claim a "
-              "Garmin device with whatever serial the COROS file carries")
+    missing = [name for name, d in
+               [("default", cfg.default_device)] + sorted(cfg.devices.items())
+               if d.serial_number is None]
+    if missing:
+        print(f"⚠️  no serial for {', '.join(missing)} — those uploads will "
+              "claim a Garmin device with whatever serial the source file "
+              "carries, which Garmin will not match to your account")
 
     cutoff = compute_cutoff(conn, cfg)
     if args.since:
@@ -670,7 +837,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         cutoff = cfg.start_date
 
     start_day, end_day = _yyyymmdd(cutoff), _yyyymmdd(date.today())
-    print(f"🌉 coros-garmin-bridge — window {start_day} … {end_day}"
+    print(f"🌉 fit-bridge {cfg.source.name} → garmin — "
+          f"window {start_day} … {end_day}"
           + ("  [dry run]" if args.dry_run else ""))
 
     run_id = None if args.dry_run else start_run(conn)
@@ -687,14 +855,17 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"   converter  : {cfg.converter_url} "
                   f"({info.get('device_count')} devices)")
 
-            coros_info = coros_source.health(cfg.coros_url, cfg.coros_api_token)
-            print(f"   coros-mcp  : {cfg.coros_url} "
-                  f"({coros_info.get('activities')} activities known)")
+            src_info = sources.health(cfg.source, cfg.source_url,
+                                      cfg.source_api_token)
+            print(f"   {cfg.source.name + '-mcp':<11}: {cfg.source_url} "
+                  f"({src_info.get('activities')} activities in its mirror)")
 
-        activities = coros_source.list_activities(
-            start_day, end_day, cfg.coros_url, api_token=cfg.coros_api_token)
+        activities = sources.list_activities(
+            cfg.source, start_day, end_day, cfg.source_url,
+            api_token=cfg.source_api_token)
         counts["considered"] = len(activities)
-        print(f"   COROS      : {len(activities)} activities in the window")
+        print(f"   {cfg.source.name.upper():<11}: {len(activities)} "
+              f"activities in the window")
 
         summaries, before_start = in_scope(activities, cfg)
 
@@ -763,7 +934,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         finish_run(conn, run_id, counts, "ok")
 
-    except (coros_source.SourceError, converter.ConversionError,
+    except (sources.SourceError, converter.ConversionError,
             garmin_sink.SinkError) as e:
         # A service-level failure, not an activity-level one: nothing was
         # marked failed, so the next run retries everything untouched.

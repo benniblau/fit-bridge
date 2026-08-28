@@ -1,6 +1,6 @@
 [Unit]
-Description=Run the COROS to Garmin bridge hourly
-Requires=coros-garmin-bridge.service
+Description=Run fit-bridge %i hourly
+Requires=fit-bridge@%i.service
 
 [Timer]
 # Hourly at :25, matching the cron entry it replaces — offset away from the

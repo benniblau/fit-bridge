@@ -1,0 +1,29 @@
+[Unit]
+# Optional alternative to the cron entries in README.md — use one or the other,
+# not both. A template unit: `fit-bridge@coros` and `fit-bridge@zwift` run the
+# same code against different configs. Pair with fit-bridge@.timer.
+#
+# The config file is read by bridge.py itself, not by systemd, because one
+# instance per bridge is the whole point and an EnvironmentFile would be
+# shared.
+Description=fit-bridge %i → Garmin (one run)
+After=network-online.target fit-manager.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=benni
+Group=benni
+WorkingDirectory=/home/benni/fit-bridge
+ExecStart=/home/benni/fit-bridge/.venv/bin/python bridge.py --config %i.env
+StandardOutput=journal
+StandardError=journal
+
+# Security hardening. ProtectHome is deliberately NOT set: this unit runs from
+# /home/benni and would not be able to see its own working directory or its
+# state database. Nothing is imported from a sibling checkout any more.
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

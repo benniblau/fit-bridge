@@ -1,27 +1,91 @@
-# coros-garmin-bridge — Claude Code Notes
+# fit-bridge — Claude Code Notes
 
 ## Project overview
 
-Benni is switching from a Garmin Fenix 8 to a COROS VERTIX 2S permanently.
 Garmin only counts activities recorded on **Garmin** devices toward badges and
-challenges, so once the Fenix is retired his Garmin record stops advancing.
+challenges. This bridge keeps a Garmin record advancing anyway: pull each new
+activity from a source as a FIT file, rewrite its recording-device identity to
+a Garmin device the account actually owns, upload it to Garmin Connect.
+One-way, hourly from cron.
 
-This bridge keeps it alive: pull each new COROS activity as a FIT file, rewrite
-its recording-device identity to the Fenix 8 he actually owns, upload it to
-Garmin Connect. One-way, COROS → Garmin, hourly from cron.
+It began as `coros-garmin-bridge`, for Benni's switch from a Fenix 8 to a COROS
+VERTIX 2S. It was renamed and re-scoped on 2026-08-28 when Zwift became a second
+source. **One instance per bridge** — `--config coros.env`, `--config
+zwift.env` — each with its own state database, pause switch, start date and
+cap, so no bridge can lose another's activities or spend its retries.
 
-**Status: live on 10.10.1.224, `BRIDGE_ENABLED=true`, running hourly from cron.
-Premise CONFIRMED on 2026-08-20. Badge award itself is still unconfirmed.**
-Garmin attributes an upload to the real Fenix 8 only when the file carries a
+**Status: COROS bridge live on 10.10.1.224, `BRIDGE_ENABLED=true`, hourly from
+cron. Premise CONFIRMED on 2026-08-20; badge award itself still unconfirmed.
+Zwift bridge built and verified as far as conversion, never uploaded.**
+
+Garmin attributes an upload to a real device only when the file carries a
 Garmin-shaped `device_info` message; the `file_id` rewrite alone yields a
-*manual activity with no device*. `fit_targeted_editor.py` in
-`../fit-manager` was extended to add the fields a COROS file omits, and
-now produces byte-for-byte the file Garmin accepted (commit `88c6be3` there).
-Read "The premise was tested on 2026-08-20 and it HOLDS" near the bottom first.
+*manual activity with no device*. Read "The premise was tested on 2026-08-20 and
+it HOLDS" near the bottom first.
 
 The first multi-activity day, 2026-08-23, then lost one run of three to a
 second identity collision — see "Garmin identifies an upload by
 (serial_number, time_created)". Read that before touching the conversion call.
+
+## Adding a source
+
+One entry in `source.py`'s `SOURCES`: how to normalise the upstream's list
+items, and what its file route needs to reach an activity the mirror has not
+synced. `bridge.py` is not touched.
+
+The contract is that the source's MCP exposes both
+`/api/v1/activities/live?start_day=&end_day=` and
+`/api/v1/activities/{id}/file`, **answering from the upstream rather than that
+project's local mirror**. The mirror is refreshed by a downloader on its own
+schedule, so an activity from ten minutes ago is not in it — which is exactly
+what an hourly bridge exists to catch.
+
+Those routes pass the upstream's payload through unchanged, deliberately, so
+normalising it is the bridge's job and happens in one place per source. The
+canonical sport vocabulary (`running`, `cycling`, …) exists because the device
+is chosen by sport and `BRIDGE_SKIP_SPORTS` has to mean the same thing whoever
+recorded the activity.
+
+### Devices are per-sport, and that is not cosmetic
+
+`BRIDGE_DEVICE_<SPORT>=product_id:serial_number` overrides `BRIDGE_PRODUCT_ID`
+/ `BRIDGE_GARMIN_SERIAL`. Zwift records both rides and runs; a run attributed to
+an Edge 1030 is incoherent, and the failure would be **invisible** — the upload
+succeeds and looks like every other one. Registered devices, confirmed against
+`GET /device-service/deviceregistration/devices` (field `unitId`, and the part
+number carries the product id: `006-B4536-00` → 4536, `006-B2713-00` → 2713):
+
+| Device | product | part number | used for |
+|---|---|---|---|
+| fenix 8 - 51mm, AMOLED | 4536 | 006-B4536-00 | everything by default |
+| Edge 1030 | 2713 | 006-B2713-00 | `BRIDGE_DEVICE_CYCLING` |
+
+Serials are `unitId` and stay out of this repo, which is public.
+
+### Zwift is the easy case, unlike COROS
+
+Established 2026-08-28 by decoding a real Zwift FIT and converting it:
+
+- Zwift writes **exactly one** `device_info`, already carrying `device_index`
+  (creator), `manufacturer`, `product` and a real `serial_number` — the three
+  fields COROS omits. `add_missing_identity_fields()` does not even need to
+  fire, and conversion is **byte-neutral** (175,027 → 175,027) where COROS
+  costs +23.
+- `file_id.serial_number` is absent, as with COROS, so that one field is still
+  added.
+- Zwift stamps `time_created` per activity (5s before `session.start_time`), so
+  it has **none** of the COROS sync-batch collision problem.
+- Garmin holds **no** cycling activities, so Zwift is not auto-syncing and
+  there is no duplication risk.
+- Zwift's `sport` is `CYCLING`/`RUNNING`; 195 vs 105 in the history.
+- Its list pages newest-first by offset with **no date filter**, so zwift-mcp
+  walks back until a whole page predates the window. Days use the activity's
+  own `utcOffsetMinutes` — a 00:30 CEST ride belongs to the previous UTC day.
+- 13 Zwift FITs are already flagged unreadable by the downloader; those will
+  fail conversion and park, which is the designed behaviour.
+
+**There have been no Zwift activities since 2026-02-26.** The sync is current,
+so that is real, not stale data. The Zwift bridge is built ahead of the season.
 
 ## Where this sits
 
@@ -30,6 +94,7 @@ Four related projects, all on GitHub under `benniblau`, all deployed to
 
 | Project | Role here |
 |---|---|
+| `../zwift-mcp` | Source, over HTTP on port **8087**. Same two routes. Its file route takes an explicit `bucket`/`key` where coros-mcp takes `sport_type`, for the same reason. **No upload endpoint exists or can** — Zwift has no activity-import API. |
 | `../coros-mcp` | Source, over HTTP on port **8086**. `GET /api/v1/activities/live` for the listing, `GET /api/v1/activities/{label_id}/file` for the bytes. It owns the COROS login, the shared token cache, region discovery, `1019` re-login and retries — none of which the bridge sees. |
 | `../garmin-mcp` | Destination. Owns the garth session, the upload call and the classification of Garmin's answer, behind `POST /api/v1/upload/fit` on port **8080**. The bridge holds no Garmin credentials. |
 | `../fit-manager` | Conversion service. Flask + gunicorn on port **7077**. The bridge calls it over HTTP; it does **not** import the editor. |

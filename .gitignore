@@ -1,5 +1,8 @@
-# Credentials and secrets
+# Credentials and secrets. One config file per bridge now, so the pattern has
+# to cover coros.env and zwift.env too — but not the *.env.example templates.
 .env
+*.env
+!*.env.example
 
 # Session tokens
 .coros_token.json
