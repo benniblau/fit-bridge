@@ -11,6 +11,7 @@ uploads it. One-way, source → Garmin, hourly from cron.
     fetch ──► <source>-mcp /api/v1/activities/{id}/file
     edit  ──► fit-manager  /api/v1/convert
     push  ──► garmin-mcp   /api/v1/upload/fit
+    hide  ──► garmin-mcp   /api/v1/activities/lookup, …/{id}/privacy   (optional)
     log   ──► <source>.db
 
 Every hop is an HTTP call to a service that already runs on this machine, so
@@ -50,6 +51,7 @@ Usage:
     python bridge.py --config zwift.env --dry-run  # list candidates only
     python bridge.py --config zwift.env --only <id>
     python bridge.py --config coros.env --status
+    python bridge.py --config coros.env --backfill-privacy
 """
 
 import argparse
@@ -90,6 +92,15 @@ TERMINAL_STATES = ("uploaded", "duplicate", "skipped")
 # all; the serial is what makes it a device Garmin can find on the account.
 DEFAULT_MANUFACTURER_ID = 1        # garmin
 DEFAULT_PRODUCT_ID = 4536          # fenix_8
+
+# Runs in which Garmin still had no activity to change, or refused the change,
+# before a visibility request is given up on. Hourly, so about a day.
+PRIVACY_MAX_ATTEMPTS = 24
+
+# How long to wait for Garmin to finish importing an upload from this very
+# run, so the activity is not left visible until the next one an hour later.
+PRIVACY_WAIT_TRIES = 6
+PRIVACY_WAIT_SECONDS = 5.0
 
 
 # ---------------------------------------------------------------------------
@@ -226,6 +237,9 @@ class Config:
     devices: Dict[str, Device] = field(default_factory=dict)
     skip_sports: Set[str] = field(default_factory=set)
     sleep_between: float = 2.0
+    # Visibility to give every bridged activity in Garmin; None leaves it at
+    # the account's default.
+    garmin_privacy: Optional[str] = None
 
     def device_for(self, sport: Optional[str]) -> Device:
         """The device an activity of this sport is attributed to."""
@@ -246,6 +260,13 @@ class Config:
         except ValueError:
             raise SystemExit(f"❌ BRIDGE_START_DATE must be YYYY-MM-DD, "
                              f"got {raw_start!r}")
+
+        garmin_privacy = os.getenv("BRIDGE_GARMIN_PRIVACY", "").strip().lower()
+        if garmin_privacy and garmin_privacy not in garmin_sink.PRIVACY_LEVELS:
+            raise SystemExit(
+                f"❌ BRIDGE_GARMIN_PRIVACY must be one of "
+                f"{', '.join(garmin_sink.PRIVACY_LEVELS)} (or empty), "
+                f"got {garmin_privacy!r}")
 
         source_name = os.getenv("BRIDGE_SOURCE", "coros").strip().lower()
         src = sources.get(source_name)
@@ -285,6 +306,7 @@ class Config:
             lookback_days=_env_int("BRIDGE_LOOKBACK_DAYS", 2),
             skip_sports=_env_str_set("BRIDGE_SKIP_SPORTS"),
             sleep_between=float(os.getenv("BRIDGE_SLEEP_BETWEEN", "2")),
+            garmin_privacy=garmin_privacy or None,
         )
 
 
@@ -305,6 +327,9 @@ _RENAMED_COLUMNS = {
 _ADDED_COLUMNS = {
     "sport": "TEXT",
     "device_product_id": "INTEGER",
+    "privacy": "TEXT",
+    "privacy_status": "TEXT",
+    "privacy_attempts": "INTEGER DEFAULT 0",
 }
 
 
@@ -706,6 +731,11 @@ def process(conn: sqlite3.Connection, cfg: Config,
                  "WHERE source_activity_id = ?", (device.product_id, label))
     conn.commit()
 
+    # A duplicate counts too: from this bridge it means an earlier upload of
+    # the same file, which is just as visible as a new one.
+    if cfg.garmin_privacy and result.status in ("uploaded", "duplicate"):
+        request_privacy(conn, label, cfg.garmin_privacy)
+
     if result.status == "uploaded":
         print(f"    ✅ uploaded — Garmin activity {result.activity_id}")
     elif result.status == "duplicate":
@@ -713,6 +743,112 @@ def process(conn: sqlite3.Connection, cfg: Config,
     else:
         print(f"    ❌ upload failed: {result.message}")
     return result.status
+
+
+# ---------------------------------------------------------------------------
+# Visibility
+# ---------------------------------------------------------------------------
+
+def request_privacy(conn: sqlite3.Connection, label_id: str,
+                    privacy: str) -> None:
+    """Note that an uploaded activity still needs its visibility changed."""
+    conn.execute(
+        "UPDATE bridge_activities SET privacy = ?, privacy_status = 'pending', "
+        "privacy_attempts = 0 WHERE source_activity_id = ?",
+        (privacy, label_id))
+    conn.commit()
+
+
+def settle_privacy(conn: sqlite3.Connection, cfg: Config,
+                   fresh: Set[str] = frozenset()) -> int:
+    """
+    Change the visibility of every activity still waiting for it.
+
+    A pass of its own rather than a step of process(), for two reasons. Garmin
+    answers an import with 202 and no activity id, so the activity has to be
+    found by its start time once the import has finished — which may be after
+    this run has ended, and the next run must be able to finish the job without
+    the source listing it again. And the upload is the one step that cannot be
+    repeated: nothing that goes wrong here may touch its recorded outcome or
+    abort the run, so this never raises.
+
+    `fresh` names activities uploaded by this run, which are worth a short
+    wait. Returns how many are still pending.
+    """
+    rows = conn.execute(
+        """SELECT source_activity_id, source_start_time, garmin_activity_id,
+                  privacy, privacy_attempts
+             FROM bridge_activities
+            WHERE privacy_status = 'pending'
+            ORDER BY source_start_time""").fetchall()
+    if not rows:
+        return 0
+
+    print(f"\n🔒 visibility: {len(rows)} to set")
+    left = 0
+    for row in rows:
+        label, start = row["source_activity_id"], row["source_start_time"]
+        try:
+            if not start:
+                raise ValueError("no start time recorded, so the Garmin "
+                                 "activity cannot be identified")
+
+            found = None
+            tries = PRIVACY_WAIT_TRIES if label in fresh else 1
+            for n in range(tries):
+                found = garmin_sink.find_activity(
+                    start, cfg.garmin_url, api_token=cfg.garmin_api_token)
+                if found or n == tries - 1:
+                    break
+                time.sleep(PRIVACY_WAIT_SECONDS)
+            if not found:
+                raise LookupError("Garmin has no activity with this start "
+                                  "time yet")
+
+            activity_id = str(found["activity_id"])
+            if found.get("privacy") != row["privacy"]:
+                garmin_sink.set_privacy(activity_id, row["privacy"],
+                                        cfg.garmin_url,
+                                        api_token=cfg.garmin_api_token)
+            conn.execute(
+                "UPDATE bridge_activities SET privacy_status = 'done', "
+                "garmin_activity_id = ? WHERE source_activity_id = ?",
+                (activity_id, label))
+            conn.commit()
+            print(f"    🔒 {label} → Garmin {activity_id} is {row['privacy']}")
+
+        except Exception as e:                                    # noqa: BLE001
+            attempts = (row["privacy_attempts"] or 0) + 1
+            gave_up = attempts >= PRIVACY_MAX_ATTEMPTS
+            conn.execute(
+                "UPDATE bridge_activities SET privacy_attempts = ?, "
+                "privacy_status = ? WHERE source_activity_id = ?",
+                (attempts, "failed" if gave_up else "pending", label))
+            conn.commit()
+            left += 0 if gave_up else 1
+            print(f"    {'❌' if gave_up else '⚠️ '} {label}: {e}"
+                  + ("  (giving up — still visible in Garmin)" if gave_up
+                     else "  (next run tries again)"))
+    return left
+
+
+def backfill_privacy(conn: sqlite3.Connection, cfg: Config,
+                     only: Optional[str]) -> int:
+    """Ask for the configured visibility on activities uploaded before now."""
+    if not cfg.garmin_privacy:
+        print("❌ BRIDGE_GARMIN_PRIVACY is not set — nothing to backfill to")
+        return 1
+    cur = conn.execute(
+        """UPDATE bridge_activities
+              SET privacy = ?, privacy_status = 'pending', privacy_attempts = 0
+            WHERE status IN ('uploaded', 'duplicate')
+              AND (privacy_status IS NOT 'done' OR privacy IS NOT ?)
+              AND (? IS NULL OR source_activity_id = ?)""",
+        (cfg.garmin_privacy, cfg.garmin_privacy, only, only))
+    conn.commit()
+    print(f"📦 {cur.rowcount} uploaded activities to make {cfg.garmin_privacy}")
+    left = settle_privacy(conn, cfg)
+    return 1 if left else 0
 
 
 # ---------------------------------------------------------------------------
@@ -732,6 +868,7 @@ def print_status(conn: sqlite3.Connection, cfg: Config) -> None:
         print(f"                {sport:<10} {device}")
     if cfg.skip_sports:
         print(f"   skipping   : {', '.join(sorted(cfg.skip_sports))}")
+    print(f"   visibility : {cfg.garmin_privacy or 'left at the Garmin default'}")
 
     rows = conn.execute("SELECT * FROM v_bridge_status").fetchall()
     if not rows:
@@ -750,6 +887,13 @@ def print_status(conn: sqlite3.Connection, cfg: Config) -> None:
             print(f"   ⚠️  {r['source_date']} {r['source_activity_id']} "
                   f"[{r['status']}, {r['attempts']} attempts] "
                   f"{(r['last_error'] or '')[:80]}")
+
+    hidden = conn.execute(
+        """SELECT privacy_status, COUNT(*) AS n FROM bridge_activities
+            WHERE privacy_status IS NOT NULL GROUP BY privacy_status""").fetchall()
+    if hidden:
+        print("\n   visibility : "
+              + ", ".join(f"{r['n']} {r['privacy_status']}" for r in hidden))
 
     runs = conn.execute("SELECT * FROM v_bridge_runs LIMIT 5").fetchall()
     if runs:
@@ -787,6 +931,10 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                         "(still floored by BRIDGE_START_DATE)")
     p.add_argument("--status", action="store_true",
                    help="Print what the state database knows and exit")
+    p.add_argument("--backfill-privacy", action="store_true",
+                   help="Apply BRIDGE_GARMIN_PRIVACY to activities already "
+                        "uploaded (all of them, or the one named by --only), "
+                        "then exit. Uploads nothing")
     return p.parse_args(argv)
 
 
@@ -803,6 +951,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.status:
         print_status(conn, cfg)
         return 0
+
+    # Ahead of the pause switch, like --only --force: cron never passes it, and
+    # it uploads nothing — it only changes who can see what is already there.
+    if args.backfill_privacy:
+        if args.dry_run:
+            print("❌ --backfill-privacy has no dry run; use --only <id> to "
+                  "try it on one activity")
+            return 1
+        return backfill_privacy(conn, cfg, args.only)
 
     # The pause switch. A dry run is a no-op by definition, so it is allowed;
     # a single named activity is allowed only when explicitly forced, because
@@ -912,13 +1069,16 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 0
 
         for s in to_skip:
-            set_outcome(conn, s["label_id"], "skipped",
-                        error=f"sport type {s['sport_type']} in BRIDGE_SKIP_SPORTS")
+            set_outcome(conn, s["activity_id"], "skipped",
+                        error=f"sport {s['sport']} in BRIDGE_SKIP_SPORTS")
             counts["skipped"] += 1
             print(f"   🗑️  skipped {describe(s)}")
 
         if not candidates:
             print("   nothing to do")
+            # Still owed from an earlier run, whose upload Garmin had not
+            # finished importing by the time it ended.
+            settle_privacy(conn, cfg)
             finish_run(conn, run_id, counts, "ok")
             return 0
 
@@ -931,6 +1091,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             counts[status] = counts.get(status, 0) + 1
             if n < len(candidates):
                 time.sleep(cfg.sleep_between)
+
+        settle_privacy(conn, cfg,
+                       fresh={s["activity_id"] for s in candidates})
 
         finish_run(conn, run_id, counts, "ok")
 

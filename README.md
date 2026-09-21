@@ -147,6 +147,45 @@ BRIDGE_LOOKBACK_DAYS)`, widened to cover anything already known and unfinished.
 That last part matters: a run capped by `BRIDGE_MAX_PER_RUN` would otherwise
 mark itself successful and move the cutoff past the activities it deferred.
 
+## Visibility
+
+`BRIDGE_GARMIN_PRIVACY=private` gives every bridged activity that visibility in
+Garmin Connect (`public`, `private`, `subscribers`, `groups`; empty leaves the
+account default).
+
+It cannot be part of the upload. Garmin's import takes no visibility field and
+answers 202 with no activity id, so the bridge asks garmin-mcp which activity
+started at the recording's start second (`GET /api/v1/activities/lookup`) and
+then changes it (`PUT /api/v1/activities/{id}/privacy`). Garmin imports
+asynchronously: a run waits up to 30 seconds for its own uploads, and whatever
+is still missing stays `privacy_status = pending` and is finished by the next
+run, without the source having to list it again. **Until then the activity has
+the account's default visibility** — seconds normally, an hour at worst.
+
+Nothing in this step can touch an upload's recorded outcome or abort a run. It
+gives up after 24 runs and says so in `--status`. As a side effect it fills in
+`garmin_activity_id`, which the upload itself never learns.
+
+    python bridge.py --config coros.env --backfill-privacy --only <id>   # one
+    python bridge.py --config coros.env --backfill-privacy               # all
+
+applies the setting to activities uploaded before it existed. It uploads
+nothing, so it works while the bridge is paused.
+
+**Check challenge progress after the first private activity.** That bridged
+uploads count was confirmed on activities with `groups` visibility; whether a
+`private` one still counts has not been observed. Compare `badgeProgressValue`
+before and after, as in CLAUDE.md.
+
+**Strava is not covered, and cannot be from here.** Garmin does not re-export
+bridged uploads: every run since 2026-08-20 exists in Strava exactly once, with
+`device_name = COROS VERTIX 2S` and `external_id = <COROS label>.fit` — put
+there by COROS's own Strava sync, which this bridge is not part of. Strava's
+API also has no writable visibility (`PUT /activities/{id}` takes name,
+description, sport_type, gear_id, trainer, commute and `hide_from_home` only).
+What does work is Strava's own *Settings → Privacy Controls → Activities →
+Only You*, which applies to every new activity at creation.
+
 ## State
 
 One database per bridge, defaulting to `<source>.db`.

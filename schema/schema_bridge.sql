@@ -22,6 +22,17 @@
 --
 -- Terminal states are never retried. `failed` is the only state that comes
 -- back, and only while it has attempts left.
+--
+-- PRIVACY VALUES (privacy_status, independent of status)
+--   NULL       nothing asked for — BRIDGE_GARMIN_PRIVACY was unset at upload
+--   pending    uploaded, visibility not yet changed. Garmin imports
+--              asynchronously and names no activity id, so this routinely
+--              survives into the next run
+--   done       Garmin confirmed the visibility in `privacy`
+--   failed     given up after repeated tries; the activity is still visible
+--
+-- Kept apart from `status` on purpose: the upload is the thing that cannot be
+-- repeated, and a visibility change that fails must never make it look undone.
 
 -- ============================================================
 -- Activities
@@ -44,7 +55,10 @@ CREATE TABLE IF NOT EXISTS bridge_activities (
     source_sha256 TEXT,              -- FIT as downloaded from the source
     converted_sha256 TEXT,           -- FIT as uploaded to Garmin
     first_seen_at TEXT,
-    uploaded_at TEXT
+    uploaded_at TEXT,
+    privacy TEXT,                    -- visibility asked for, e.g. private
+    privacy_status TEXT,             -- NULL|pending|done|failed
+    privacy_attempts INTEGER DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_bridge_activities_status
@@ -103,7 +117,9 @@ SELECT source_activity_id,
        garmin_activity_id,
        attempts,
        last_error,
-       uploaded_at
+       uploaded_at,
+       privacy,
+       privacy_status
 FROM bridge_activities
 ORDER BY source_date DESC, source_start_time DESC;
 

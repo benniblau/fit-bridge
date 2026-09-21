@@ -300,6 +300,27 @@ Not in the original design, and each one was arrived at the hard way.
   into an `UploadError` — otherwise a missing credential takes down the whole
   MCP server, not just one request.
 
+### Visibility is a second pass, not part of the upload
+
+`BRIDGE_GARMIN_PRIVACY` (added 2026-09-21). The import endpoint takes no
+visibility and returns no activity id, so `settle_privacy()` finds the activity
+by start second — the list's `beginTimestamp` is `source_start_time` × 1000,
+verified on `24407913639` — and PUTs `accessControlRuleDTO` through garmin-mcp.
+Type ids: 1 public, 2 private, 3 subscribers, 4 groups; the account default here
+is `groups`. State is `privacy_status`, deliberately separate from `status`:
+the pass never raises, never aborts a run and never touches an upload's
+outcome. A `pending` row is finished by a later run from the database alone.
+
+**The PUT itself had not been exercised against Garmin when this was written**
+— only the lookup was, read-only. Nor is it known whether a `private` activity
+still counts toward challenges; the 2026-08-28 confirmation was on `groups`.
+
+**Strava is out of reach.** Garmin does not re-export bridged uploads — the
+third-party lore in `garmin_files.py` holds: all runs since 2026-08-20 are in
+Strava once, from COROS's own sync (`external_id = <label>.fit`). And Strava's
+API has no writable visibility. So there is no Strava copy that is the bridge's
+to hide, and no API to hide it with.
+
 ## Conventions to follow
 
 Match the sibling projects:

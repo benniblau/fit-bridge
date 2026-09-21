@@ -22,6 +22,10 @@ in `status`:
 
 A 4xx means the request was wrong and a 5xx means Garmin never answered. Only
 the latter is worth retrying, and only the latter aborts a run.
+
+Visibility is a separate, later step, because Garmin answers an import with 202
+and no activity id: `find_activity()` asks which activity started at a given
+second, and `set_privacy()` changes it. Neither is part of the upload's verdict.
 """
 
 from dataclasses import dataclass
@@ -31,6 +35,11 @@ import requests
 
 UPLOAD_PATH = "/api/v1/upload/fit"
 HEALTH_PATH = "/api/v1/upload/health"
+LOOKUP_PATH = "/api/v1/activities/lookup"
+PRIVACY_PATH = "/api/v1/activities/{activity_id}/privacy"
+
+# What Garmin calls its visibility levels; `subscribers` is "My Connections".
+PRIVACY_LEVELS = ("public", "private", "subscribers", "groups")
 
 # Garmin's import endpoint answers 202 and decides asynchronously, so the
 # service is normally quick — but it may be renewing an OAuth token underneath.
@@ -153,3 +162,49 @@ def upload_fit(data: bytes, filename: str, base_url: str,
         message=body.get("message"),
         http_status=body.get("http_status"),
     )
+
+
+def find_activity(start_time: int, base_url: str,
+                  api_token: Optional[str] = None,
+                  timeout: int = 60) -> Optional[Dict[str, Any]]:
+    """
+    The Garmin activity that started at `start_time` (unix seconds), or None.
+
+    None is the ordinary answer for a little while after an upload: Garmin
+    imports asynchronously, and the activity does not exist until it is done.
+    Raises SinkError for anything else, which says nothing about the activity.
+    """
+    try:
+        resp = requests.get(base_url.rstrip("/") + LOOKUP_PATH,
+                            params={"start_time": int(start_time)},
+                            headers=_headers(api_token), timeout=timeout)
+    except requests.RequestException as e:
+        raise SinkError(f"garmin-mcp unreachable while looking up "
+                        f"{start_time}: {e}") from e
+
+    if resp.status_code == 404:
+        return None
+    if resp.status_code != 200:
+        raise SinkError(f"garmin-mcp lookup returned HTTP {resp.status_code}: "
+                        f"{_error_text(resp)}")
+    try:
+        return resp.json() or {}
+    except ValueError:
+        raise SinkError("garmin-mcp did not answer a lookup with JSON")
+
+
+def set_privacy(activity_id: str, privacy: str, base_url: str,
+                api_token: Optional[str] = None, timeout: int = 60) -> None:
+    """Set one Garmin activity's visibility. Raises SinkError if it did not take."""
+    try:
+        resp = requests.put(
+            base_url.rstrip("/") + PRIVACY_PATH.format(activity_id=activity_id),
+            json={"privacy": privacy},
+            headers=_headers(api_token), timeout=timeout)
+    except requests.RequestException as e:
+        raise SinkError(f"garmin-mcp unreachable while setting privacy on "
+                        f"{activity_id}: {e}") from e
+
+    if resp.status_code != 200:
+        raise SinkError(f"garmin-mcp could not set {activity_id} to {privacy}: "
+                        f"HTTP {resp.status_code}: {_error_text(resp)}")
