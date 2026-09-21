@@ -311,9 +311,23 @@ is `groups`. State is `privacy_status`, deliberately separate from `status`:
 the pass never raises, never aborts a run and never touches an upload's
 outcome. A `pending` row is finished by a later run from the database alone.
 
-**The PUT itself had not been exercised against Garmin when this was written**
-— only the lookup was, read-only. Nor is it known whether a `private` activity
-still counts toward challenges; the 2026-08-28 confirmation was on `groups`.
+**Exercised for real on 2026-09-21**, deployed with
+`BRIDGE_GARMIN_PRIVACY=private` in both configs: `--backfill-privacy --only
+480427528031338696` turned Garmin `24407913639` from `groups` to `private`,
+confirmed on `/activity-service/activity/{id}`. The activity *list* kept saying
+`groups` for a few seconds afterwards — it is briefly stale after a PUT just as
+it is after a DELETE, so read the activity itself back, not the list.
+
+Still unknown: whether a `private` activity counts toward challenges. The
+2026-08-28 confirmation was on `groups`, and "2026 Running - Stage 3" can no
+longer answer it — it reads 300000.0 / 300000.0, clamped at its target. Use a
+challenge that is still open.
+
+**The live ledgers are `/home/benni/coros.db` and `/home/benni/zwift.db`, not
+the ones in the checkout.** `BRIDGE_DB_PATH=coros.db` is relative and cron runs
+from `~`. The copies under `fit-bridge/` stopped on 2026-08-28. Any manual
+command — `--status`, `--backfill-privacy` — must be run from `~` or it reads
+and writes the stale copy.
 
 **Strava is out of reach.** Garmin does not re-export bridged uploads — the
 third-party lore in `garmin_files.py` holds: all runs since 2026-08-20 are in
